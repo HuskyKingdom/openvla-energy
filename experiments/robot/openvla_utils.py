@@ -938,7 +938,7 @@ def k_step_energy_correction_seq(
             act_range_t = act_range.to(device=device, dtype=dtype)
         act_range_t = act_range_t.view(1, 1, -1)  # [1,1,Da]
 
-    # k iterations of residule correction
+    # k iterations of residual correction
     for _ in range(max(1, int(k))):
         A = A.detach().clone().requires_grad_(True)
         with torch.enable_grad():
@@ -950,7 +950,12 @@ def k_step_energy_correction_seq(
             mask = torch.zeros_like(grad_A); mask[:, 0, :] = 1.0
             grad_A = grad_A * mask
 
-        step = alpha * grad_A
+        # Normalise gradient to unit direction, then scale by alpha.
+        # With GAL-trained energy head the direction is reliable;
+        # normalisation prevents magnitude-dependent step sizes.
+        grad_norm = grad_A.flatten(1).norm(dim=-1, keepdim=True).clamp(min=1e-8)  # [1,1]
+        grad_dir = grad_A / grad_norm.view(1, 1, 1)     # unit direction
+        step = alpha * grad_dir
 
         if act_range is not None:
             max_step = (clip_frac * act_range_t).to(step.dtype)

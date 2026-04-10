@@ -149,8 +149,11 @@ def assert_finite(x, name):
 class EnergyModel(nn.Module):
     """
     E_phi(s, a):
-    input: hN(s) [B, seq, D_h], a [B, chunk, D_a] 
+    input: hN(s) [B, seq, D_h], a [B, chunk, D_a]
     output: energy [B, 1]
+
+    Uses softplus activation (no sigmoid saturation) so the gradient
+    w.r.t. actions remains informative everywhere.
     """
     def __init__(
         self,
@@ -162,12 +165,10 @@ class EnergyModel(nn.Module):
     ):
         super().__init__()
 
-     
-        # self.energy_bc = FFWRelativeCrossAttentionModule(hidden,head,layers)
         self.cross = nn.MultiheadAttention(hidden, head, batch_first=True)
 
         # pos emb
-        self.pe_layer = PositionalEncoding(hidden,0.2)
+        self.pe_layer = PositionalEncoding(hidden, 0.2)
 
         self.state_linear = MLPResNet(
             num_blocks=1, input_dim=state_dim, hidden_dim=hidden, output_dim=hidden
@@ -180,81 +181,35 @@ class EnergyModel(nn.Module):
         )
         self.pool = SeqPool(mode="mean")
 
-
-        self.T = 30.0               # temperature for energy range
-        
-        self.act = nn.Sigmoid() 
-        # self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden))
-        self.energy_scale = 2.0
-        self.energy_offset = 0.1
-    
-
-    def forward(self, hN: torch.Tensor, a: torch.Tensor, pad_mask = None, reduce="sum", gamma=None) -> torch.Tensor:
+    def forward(self, hN: torch.Tensor, a: torch.Tensor, pad_mask=None, reduce="sum", gamma=None) -> torch.Tensor:
         """
         hN: [B, S, D_h], a: [B, H,  D_a]
         return: energy [B, 1]
         """
-
-        # context_mapped = self.state_linear(hN)  # [B,S,Dh]
-        # action_mapped  = self.pe_layer(self.action_linear(a))  # [B,H,Da]
-        # cls_tokens = self.cls_token.expand(hN.shape[0], -1, -1)
-
-        # energy_concat = torch.cat([cls_tokens, context_mapped, action_mapped], dim=1).to(hN.dtype)  # [B,S+H+1,Da]
-
-        # energy_features = self.energy_bc(energy_concat.transpose(0,1), diff_ts=None,
-        #         query_pos=None, context=None, context_pos=None,pad_mask=pad_mask)[-1].transpose(0,1)  # [B,S+H+1,Da]
-        
-
-        # # energy_cls = energy_features[:,0,:].squeeze(1)
-        # E = self.prediction_head(energy_cls) # [B, 1]
-
-
         hN = hN.float()
         a  = a.float()
-        
+
         assert_finite(hN, "hN")
         assert_finite(a,  "a")
-        
 
         if pad_mask is not None:
             if pad_mask.all(dim=1).any():
                 raise RuntimeError("[NaN-risk] some rows key_padding_mask are all True")
 
+        context_mapped = self.state_linear(hN)                    # [B,S,Hd]
+        action_mapped  = self.pe_layer(self.action_linear(a))     # [B,H,Hd]
 
-    
-        # return E
-        context_mapped = self.state_linear(hN)  # [B,S,Dh]
-        action_mapped  = self.pe_layer(self.action_linear(a))  # [B,H,Da]
-        # assert_finite(context_mapped, "context_mapped")
-        # assert_finite(action_mapped,  "action_mapped")
+        Z, _ = self.cross(
+            query=action_mapped, key=context_mapped, value=context_mapped,
+            need_weights=False, key_padding_mask=pad_mask,
+        )
 
-        # energy_feat = self.energy_bc(query=action_mapped.transpose(0, 1),
-        #     value=context_mapped.transpose(0, 1),
-        #     query_pos=None,
-        #     value_pos=None,
-        #     diff_ts=None)[-1].transpose(0,1) # [B,H,Da]
-        
-        # energy_feat = energy_feat + self.gate_a * action_mapped 
+        raw = self.prediction_head(Z)                             # [B,H,1]
+        # softplus: non-negative, no saturation → healthy gradients everywhere
+        E = F.softplus(raw, beta=1.0) + 1e-4                     # [B,H,1]
 
-        # energy = self.pool(energy_feat) # [B,Da]
-        # E = self.prediction_head(energy) # [B, 1]
-
-
-        Z, _ = self.cross(query=action_mapped, key=context_mapped, value=context_mapped, need_weights=False, key_padding_mask=pad_mask)
-        # assert_finite(Z, "attn_out")
-
-        energy_feature_step = self.prediction_head(Z)
-        # assert_finite(energy_feature_step, "energy_feature_step")
-
-
-        # raw = self.T * torch.tanh(raw / self.T)
-        energy_feature_step = energy_feature_step * 0.5
-        E = self.act(energy_feature_step) * self.energy_scale + self.energy_offset
-        # assert_finite(E, "E")
-
-        energy_avg = self.pool(E)
+        energy_avg = self.pool(E)                                 # [B,1]
         assert_finite(energy_avg, "energy_avg")
-
         return energy_avg
 
         
@@ -533,4 +488,144 @@ def energy_inbatch_swap_infonce_2d(
     E_pos_mean = torch.diag(E_ij).mean()
     E_neg_mean = E_ij[_offdiag_mask(B, device)].mean() if B > 1 else torch.tensor(0., device=device)
 
+    return loss, E_pos_mean, E_neg_mean
+
+
+# ---------------------------------------------------------------------------
+# New losses: Gradient Alignment + Multi-Scale Hard-Negative InfoNCE
+# ---------------------------------------------------------------------------
+
+def gradient_alignment_loss(
+    energy_model,
+    h: torch.Tensor,            # [B, S, D]
+    a_expert: torch.Tensor,     # [B, H, Da]
+    pad_mask: torch.Tensor,
+    sigma: float = 0.15,
+    n_samples: int = 4,
+):
+    """
+    Gradient-Alignment Loss (GAL).
+
+    Ensures that the energy gradient w.r.t. action points toward the expert
+    action from any nearby point.  This directly shapes the gradient field so
+    that a single descent step at inference reliably improves the action.
+
+        L_align = 1 - cos_sim( ∇_a E(h, a_noisy),  a_expert - a_noisy )
+
+    We average over *n_samples* noise realisations per sample.
+    """
+    B, H, Da = a_expert.shape
+    device = a_expert.device
+    dtype = next(energy_model.parameters()).dtype
+
+    h_input = h.to(dtype).detach()
+    a_star = a_expert.to(dtype).detach()
+
+    total_cos = torch.zeros(1, device=device)
+
+    for _ in range(n_samples):
+        noise = torch.randn_like(a_star) * sigma
+        a_noisy = (a_star + noise).detach().requires_grad_(True)
+
+        pm = None
+        if pad_mask is not None:
+            pm = pad_mask
+
+        E = energy_model(h_input, a_noisy, pm)            # [B,1]
+        grad_a = torch.autograd.grad(
+            E.sum(), a_noisy, create_graph=True
+        )[0]                                                # [B,H,Da]
+
+        # target direction: from noisy toward expert (normalised)
+        direction = (a_star - a_noisy)                      # [B,H,Da]
+
+        # cosine similarity per sample, then mean
+        cos = F.cosine_similarity(
+            grad_a.reshape(B, -1),
+            direction.reshape(B, -1),
+            dim=-1,
+        )                                                   # [B]
+        total_cos = total_cos + cos.mean()
+
+    avg_cos = total_cos / n_samples
+    loss_align = 1.0 - avg_cos                              # want cos → 1
+    return loss_align
+
+
+def multi_scale_hard_negative_infonce(
+    energy_model,
+    h: torch.Tensor,            # [B, S, D]
+    a_pos: torch.Tensor,        # [B, H, Da]
+    pad_mask: torch.Tensor,
+    layer_actions: list,         # list of [B, H, Da] from intermediate layers
+    sigmas: Tuple[float, ...] = (0.05, 0.2, 0.5),
+    tau: float = 0.5,
+):
+    """
+    Multi-Scale Hard-Negative InfoNCE.
+
+    Negatives come from three sources, each providing a different "distance
+    ring" around the expert action:
+
+      1. In-batch swap  (other expert actions under wrong states)
+      2. Intermediate-layer BC predictions  (partially decoded actions)
+      3. Gaussian-perturbed expert actions at multiple σ scales
+
+    Combining them produces a well-shaped energy landscape from near to far.
+    """
+    B, S, D = h.shape
+    H, Da   = a_pos.shape[1], a_pos.shape[2]
+    device  = h.device
+    dtype   = next(energy_model.parameters()).dtype
+
+    h_d = h.to(dtype)
+    a_d = a_pos.to(dtype)
+
+    # --- collect negative actions [B, M, H, Da] ---
+    neg_list = []
+
+    # (a) in-batch swap: use other samples' expert actions
+    if B > 1:
+        idx_shift = (torch.arange(B, device=device) + 1) % B
+        neg_list.append(a_d[idx_shift].unsqueeze(1))           # [B,1,H,Da]
+
+    # (b) intermediate-layer BC actions (pick 1-2 layers)
+    if layer_actions is not None and len(layer_actions) > 1:
+        mid = len(layer_actions) // 2
+        for li in [mid, 1]:
+            if li < len(layer_actions):
+                neg_list.append(
+                    layer_actions[li].to(dtype).detach().unsqueeze(1)
+                )                                              # [B,1,H,Da]
+
+    # (c) multi-scale Gaussian perturbations
+    for sigma in sigmas:
+        noise = torch.randn_like(a_d) * sigma
+        neg_list.append((a_d + noise).unsqueeze(1))            # [B,1,H,Da]
+
+    a_negs = torch.cat(neg_list, dim=1)                        # [B, M, H, Da]
+    M = a_negs.shape[1]
+
+    # --- compute energies ---
+    E_pos = energy_model(h_d, a_d, pad_mask)                   # [B,1]
+    E_pos_sq = E_pos.squeeze(-1)                               # [B]
+
+    # flatten negatives for batched forward
+    a_neg_flat = a_negs.reshape(B * M, H, Da)
+    h_rep = h_d.unsqueeze(1).expand(B, M, S, D).reshape(B * M, S, D)
+    pm = None
+    if pad_mask is not None:
+        pm = pad_mask.unsqueeze(1).expand(B, M, pad_mask.size(1)).reshape(B * M, pad_mask.size(1))
+
+    E_neg = energy_model(h_rep, a_neg_flat, pm)                # [B*M,1]
+    E_neg = E_neg.view(B, M)                                   # [B, M]
+
+    # --- InfoNCE: positive at index 0 ---
+    logits = torch.cat([(-E_pos_sq).unsqueeze(1), -E_neg], dim=1) / tau   # [B, 1+M]
+    labels = torch.zeros(B, dtype=torch.long, device=device)
+
+    loss = F.cross_entropy(logits, labels)
+
+    E_pos_mean = E_pos_sq.detach().mean()
+    E_neg_mean = E_neg.detach().mean()
     return loss, E_pos_mean, E_neg_mean
