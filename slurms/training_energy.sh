@@ -35,7 +35,7 @@ torchrun --standalone --nnodes 1 --nproc-per-node 8 vla-scripts/finetune_Energy_
   --save_freq             5000 \
   --save_latest_checkpoint_only False \
   --image_aug             True \
-  --use_lora              False \
+  --use_lora              True \
   --wandb_entity          "yhscode-university-of-liverpool" \
   --wandb_project         "energyvla" \
   --run_id_note           vel_gal_multiscale

@@ -507,54 +507,56 @@ def gradient_alignment_loss(
     pad_mask: torch.Tensor,
     sigma: float = 0.15,
     n_samples: int = 4,
+    eps: float = 0.05,
+    margin: float = 0.05,
 ):
     """
-    Gradient-Alignment Loss (GAL).
+    Gradient-Alignment Loss (GAL) — first-order directional version.
 
-    Ensures that the energy gradient w.r.t. action points toward the expert
-    action from any nearby point.  This directly shapes the gradient field so
-    that a single descent step at inference reliably improves the action.
+    Directly computing ∇_a E via create_graph=True is numerically unstable
+    through attention layers (requires mixed Hessian ∂²E/∂a∂W).
 
-        L_align = 1 - cos_sim( ∇_a E(h, a_noisy),  a_expert - a_noisy )
+    Equivalent first-order formulation: if the gradient of E w.r.t. action
+    points toward a_expert, then moving *away* from a_expert must raise the
+    energy. We enforce this with a margin loss over finite differences:
 
-    We average over *n_samples* noise realisations per sample.
+        a_near  = a_noisy  (sampled near expert)
+        a_away  = a_noisy + eps * away_dir   (step away from expert)
+        L_align = mean( ReLU( E(a_near) - E(a_away) + margin ) )
+
+    This is entirely first-order — no create_graph, no Hessian, numerically
+    stable through any attention kernel.
     """
     B, H, Da = a_expert.shape
     device = a_expert.device
     dtype = next(energy_model.parameters()).dtype
 
     h_input = h.to(dtype).detach()
-    a_star = a_expert.to(dtype).detach()
+    a_star  = a_expert.to(dtype).detach()
 
-    total_cos = torch.zeros(1, device=device)
+    total_loss = torch.zeros(1, device=device)
 
     for _ in range(n_samples):
         noise = torch.randn_like(a_star) * sigma
-        a_noisy = (a_star + noise).detach().requires_grad_(True)
+        a_noisy = (a_star + noise).detach()                # [B,H,Da]
 
-        pm = None
-        if pad_mask is not None:
-            pm = pad_mask
+        # unit direction *away* from expert
+        away = (a_noisy - a_star)                          # [B,H,Da]
+        away_norm = away.flatten(1).norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        away_dir  = away / away_norm.view(B, 1, 1)         # unit vector [B,H,Da]
 
-        E = energy_model(h_input, a_noisy, pm)            # [B,1]
-        grad_a = torch.autograd.grad(
-            E.sum(), a_noisy, create_graph=True
-        )[0]                                                # [B,H,Da]
+        a_away = (a_noisy + eps * away_dir).detach()       # [B,H,Da]
 
-        # target direction: from noisy toward expert (normalised)
-        direction = (a_star - a_noisy)                      # [B,H,Da]
+        pm = pad_mask  # may be None
 
-        # cosine similarity per sample, then mean
-        cos = F.cosine_similarity(
-            grad_a.reshape(B, -1),
-            direction.reshape(B, -1),
-            dim=-1,
-        )                                                   # [B]
-        total_cos = total_cos + cos.mean()
+        E_near = energy_model(h_input, a_noisy, pm)        # [B,1]
+        E_away = energy_model(h_input, a_away,  pm)        # [B,1]
 
-    avg_cos = total_cos / n_samples
-    loss_align = 1.0 - avg_cos                              # want cos → 1
-    return loss_align
+        # E_away should be HIGHER than E_near (moving away from expert costs energy)
+        loss = F.relu(E_near - E_away + margin).mean()
+        total_loss = total_loss + loss
+
+    return total_loss / n_samples
 
 
 def multi_scale_hard_negative_infonce(
