@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=92
 
-cd /work1/chunyilee/yuhang/openvla-oft-yhs
+cd /work1/chunyilee/yuhang/openvla-energy
 export WANDB_API_KEY=0bdbd99b1136358467ed2d03e9a6ba5a5b2a11a8
 export HF_HOME=/work1/aiginternal/yuhang/
 export OMP_NUM_THREADS=11
