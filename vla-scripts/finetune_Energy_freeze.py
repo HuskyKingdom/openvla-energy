@@ -506,38 +506,29 @@ def run_forward_pass(
         energy_mask = context_mask
 
         with torch.cuda.amp.autocast(enabled=False):
-            # --- Multi-Scale Hard-Negative InfoNCE (replaces vanilla in-batch swap) ---
-            nce_loss, E_pos_mean, E_neg_mean = multi_scale_hard_negative_infonce(
+            # --- In-batch swap InfoNCE (proven stable) ---
+            swap_loss, E_pos_mean, E_neg_mean = energy_inbatch_swap_infonce(
                 energy_model, context_hidden, ground_truth_actions,
-                energy_mask, layer_actions,
-                sigmas=(0.15, 0.3, 0.6), tau=0.1,
+                energy_mask, tau=0.3,
             )
 
-            # --- Gradient Alignment Loss (new) ---
-            gal_loss = gradient_alignment_loss(
-                energy_model, context_hidden, ground_truth_actions,
-                energy_mask, sigma=0.15, n_samples=4,
-            )
-
-            # --- Anti-collapse margin loss (with gradient) ---
-            # E_pos_mean / E_neg_mean from NCE are detached (for logging).
-            # Compute fresh E_pos with full gradient for the gap constraint.
-            E_pos_live = energy_model(context_hidden.detach(), ground_truth_actions, energy_mask)  # [B,1]
-            # For E_neg: use one shifted batch as a cheap representative negative
-            if ground_truth_actions.shape[0] > 1:
-                idx_shift = (torch.arange(ground_truth_actions.shape[0], device=ground_truth_actions.device) + 1) % ground_truth_actions.shape[0]
-                E_neg_live = energy_model(context_hidden.detach(), ground_truth_actions[idx_shift], energy_mask)  # [B,1]
+            # --- Anti-collapse: margin on live (non-detached) energies ---
+            E_pos_live = energy_model(context_hidden.detach(), ground_truth_actions, energy_mask)
+            B_act = ground_truth_actions.shape[0]
+            if B_act > 1:
+                idx_shift = (torch.arange(B_act, device=ground_truth_actions.device) + 1) % B_act
+                E_neg_live = energy_model(context_hidden.detach(), ground_truth_actions[idx_shift], energy_mask)
             else:
-                noise = torch.randn_like(ground_truth_actions) * 0.3
-                E_neg_live = energy_model(context_hidden.detach(), ground_truth_actions + noise, energy_mask)
+                E_neg_live = energy_model(context_hidden.detach(), ground_truth_actions + 0.3 * torch.randn_like(ground_truth_actions), energy_mask)
 
             min_gap = 0.5
             gap_loss = F.relu(min_gap - (E_neg_live.mean() - E_pos_live.mean()))
 
-            # combined loss
-            lambda_gal = 0.5
-            lambda_gap = 2.0
-            energy_loss = nce_loss + lambda_gal * gal_loss + lambda_gap * gap_loss
+            # Placeholders for logging compatibility
+            nce_loss = swap_loss
+            gal_loss = torch.zeros(1, device=swap_loss.device)
+
+            energy_loss = swap_loss + 1.0 * gap_loss
 
 
 
