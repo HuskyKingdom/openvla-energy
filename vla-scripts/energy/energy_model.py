@@ -199,10 +199,15 @@ class EnergyModel(nn.Module):
         context_mapped = self.state_linear(hN)                    # [B,S,Hd]
         action_mapped  = self.pe_layer(self.action_linear(a))     # [B,H,Hd]
 
-        Z, _ = self.cross(
-            query=action_mapped, key=context_mapped, value=context_mapped,
-            need_weights=False, key_padding_mask=pad_mask,
-        )
+        # Force math backend: efficient/flash attention does not implement
+        # the backward of backward, which GAL requires (create_graph=True).
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False, enable_math=True, enable_mem_efficient=False
+        ):
+            Z, _ = self.cross(
+                query=action_mapped, key=context_mapped, value=context_mapped,
+                need_weights=False, key_padding_mask=pad_mask,
+            )
 
         raw = self.prediction_head(Z)                             # [B,H,1]
         # softplus: non-negative, no saturation → healthy gradients everywhere
