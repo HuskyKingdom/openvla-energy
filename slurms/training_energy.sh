@@ -13,7 +13,9 @@ export HF_HOME=/work1/chunyilee/yuhang/
 export OMP_NUM_THREADS=11
 
 
-PRETRAINED_CKPT=openvla/openvla-7b
+# Must be the already-fine-tuned OpenVLA-OFT checkpoint (with merged LoRA + action head),
+# NOT openvla/openvla-7b — the frozen backbone must produce meaningful hidden states.
+PRETRAINED_CKPT=moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10
 
 torchrun --standalone --nnodes 1 --nproc-per-node 8 vla-scripts/finetune_Energy_freeze.py \
   --vla_path              $PRETRAINED_CKPT \
@@ -33,7 +35,7 @@ torchrun --standalone --nnodes 1 --nproc-per-node 8 vla-scripts/finetune_Energy_
   --save_freq             5000 \
   --save_latest_checkpoint_only False \
   --image_aug             True \
-  --lora_rank             32 \
+  --use_lora              False \
   --wandb_entity          "yhscode-university-of-liverpool" \
   --wandb_project         "energyvla" \
   --run_id_note           vel_gal_multiscale
