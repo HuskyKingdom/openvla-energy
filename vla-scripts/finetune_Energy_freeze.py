@@ -519,13 +519,24 @@ def run_forward_pass(
                 energy_mask, sigma=0.15, n_samples=4,
             )
 
-            # --- Anti-collapse margin loss: force a minimum gap between E_neg and E_pos ---
-            min_gap = 0.5  # E_neg should be at least this much higher than E_pos
-            gap_loss = F.relu(min_gap - (E_neg_mean - E_pos_mean))
+            # --- Anti-collapse margin loss (with gradient) ---
+            # E_pos_mean / E_neg_mean from NCE are detached (for logging).
+            # Compute fresh E_pos with full gradient for the gap constraint.
+            E_pos_live = energy_model(context_hidden.detach(), ground_truth_actions, energy_mask)  # [B,1]
+            # For E_neg: use one shifted batch as a cheap representative negative
+            if ground_truth_actions.shape[0] > 1:
+                idx_shift = (torch.arange(ground_truth_actions.shape[0], device=ground_truth_actions.device) + 1) % ground_truth_actions.shape[0]
+                E_neg_live = energy_model(context_hidden.detach(), ground_truth_actions[idx_shift], energy_mask)  # [B,1]
+            else:
+                noise = torch.randn_like(ground_truth_actions) * 0.3
+                E_neg_live = energy_model(context_hidden.detach(), ground_truth_actions + noise, energy_mask)
+
+            min_gap = 0.5
+            gap_loss = F.relu(min_gap - (E_neg_live.mean() - E_pos_live.mean()))
 
             # combined loss
             lambda_gal = 0.5
-            lambda_gap = 1.0
+            lambda_gap = 2.0
             energy_loss = nce_loss + lambda_gal * gal_loss + lambda_gap * gap_loss
 
 
