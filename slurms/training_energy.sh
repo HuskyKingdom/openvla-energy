@@ -9,7 +9,7 @@
 
 cd /work1/chunyilee/yuhang/openvla-energy
 export WANDB_API_KEY=0bdbd99b1136358467ed2d03e9a6ba5a5b2a11a8
-export HF_HOME=/work1/aiginternal/yuhang/
+export HF_HOME=/work1/chunyilee/yuhang/
 export OMP_NUM_THREADS=11
 
 
