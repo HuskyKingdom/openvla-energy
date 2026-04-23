@@ -7,6 +7,29 @@ from .layers import FFWRelativeSelfAttentionModule, FFWRelativeCrossAttentionMod
 from .position_encodings import PositionalEncoding
 
 
+# ----------------------------------------------------------------------------
+# SDPA backend selector.
+#
+# GAL (gradient_alignment_loss) does a second backward through the energy head,
+# which would otherwise hit:
+#   RuntimeError: derivative for aten::_scaled_dot_product_efficient_attention_backward
+#                 is not implemented
+# because flash / mem-efficient SDPA don't support double-backward. Forcing the
+# MATH backend is cheap here (small cross-attn: B≈8, seq≈300, single layer) and
+# guarantees double-backward works across torch versions.
+# ----------------------------------------------------------------------------
+try:
+    from torch.nn.attention import sdpa_kernel as _sdpa_kernel_new, SDPBackend as _SDPBackend
+
+    def _math_sdpa():
+        return _sdpa_kernel_new([_SDPBackend.MATH])
+except ImportError:
+    from torch.backends.cuda import sdp_kernel as _sdpa_kernel_legacy
+
+    def _math_sdpa():
+        return _sdpa_kernel_legacy(enable_flash=False, enable_math=True, enable_mem_efficient=False)
+
+
 class SeqPool(nn.Module):
     def __init__(self, mode="mean"):
         super().__init__()
@@ -239,7 +262,10 @@ class EnergyModel(nn.Module):
         # E = self.prediction_head(energy) # [B, 1]
 
 
-        Z, _ = self.cross(query=action_mapped, key=context_mapped, value=context_mapped, need_weights=False, key_padding_mask=pad_mask)
+        # MATH backend required for GAL's double-backward (see _math_sdpa comment).
+        with _math_sdpa():
+            Z, _ = self.cross(query=action_mapped, key=context_mapped, value=context_mapped,
+                              need_weights=False, key_padding_mask=pad_mask)
 
         # Per-step raw energy, unbounded. No sigmoid / scale / offset.
         # Aggregation: mean over action chunk steps → [B, 1].

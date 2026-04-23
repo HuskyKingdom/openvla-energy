@@ -7,6 +7,21 @@ from .layers import FFWRelativeSelfAttentionModule, FFWRelativeCrossAttentionMod
 from .position_encodings import PositionalEncoding
 
 
+# Force MATH SDPA backend — required for GAL's double-backward during training,
+# and kept at inference so numerics match the trained weights exactly
+# (flash/mem-efficient kernels can give slightly different values).
+try:
+    from torch.nn.attention import sdpa_kernel as _sdpa_kernel_new, SDPBackend as _SDPBackend
+
+    def _math_sdpa():
+        return _sdpa_kernel_new([_SDPBackend.MATH])
+except ImportError:
+    from torch.backends.cuda import sdp_kernel as _sdpa_kernel_legacy
+
+    def _math_sdpa():
+        return _sdpa_kernel_legacy(enable_flash=False, enable_math=True, enable_mem_efficient=False)
+
+
 class SeqPool(nn.Module):
     def __init__(self, mode="mean"):
         super().__init__()
@@ -236,7 +251,9 @@ class EnergyModel(nn.Module):
         # E = self.prediction_head(energy) # [B, 1]
 
 
-        Z, _ = self.cross(query=action_mapped, key=context_mapped, value=context_mapped, need_weights=False, key_padding_mask=pad_mask)
+        with _math_sdpa():
+            Z, _ = self.cross(query=action_mapped, key=context_mapped, value=context_mapped,
+                              need_weights=False, key_padding_mask=pad_mask)
 
         energy_feature_step = self.prediction_head(Z)     # [B, H, 1]
         energy_avg = self.pool(energy_feature_step)       # [B, 1]

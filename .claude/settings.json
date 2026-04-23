@@ -2,6 +2,9 @@
   "permissions": {
     "additionalDirectories": [
       "/home/yuhang/Desktop/oft-workspace/openvla-energy"
+    ],
+    "allow": [
+      "Bash(python3 -c 'import ast *)"
     ]
   }
 }
