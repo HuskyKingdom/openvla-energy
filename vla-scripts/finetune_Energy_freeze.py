@@ -515,8 +515,12 @@ def run_forward_pass(
                 tau=1.0,
                 beta_margin=2.0,
                 lambda_margin=1.0,
-                lambda_gal=0.1,
-                gal_sigmas=(0.05, 0.15, 0.30),
+                # Tuned after run vel_gal_multiscale (5k steps): GAL_cos degraded
+                # 0.2 → 0.06 because (a) λ_gal=0.1 made GAL <1% of total loss,
+                # (b) σ=0.30 samples the flat far-field where grad direction is
+                # noise. Bumping λ_gal to 1.0 and tightening σ to BC-error scale.
+                lambda_gal=1.0,
+                gal_sigmas=(0.03, 0.08, 0.15),
                 enable_gal=True,
             )
             E_pos_mean = energy_terms["E_pos"]
