@@ -971,6 +971,96 @@ def k_step_energy_correction_seq(
     print(f"Action Energy: {E.item():.10f} | Corrected Action Energy: {E_corrected.item():.10f}")
     return A.squeeze(0).detach().cpu().to(torch.float32).numpy()
 
+
+def line_search_energy_correction_seq(
+    energy_head,
+    h,
+    A_bc,
+    energy_mask,
+    alphas=(0.2, 0.1, 0.05, 0.0),
+    correct_first_only: bool = False,
+    verbose: bool = False,
+):
+    """
+    VEL v2 (P1): energy-monitored line-search correction.
+
+    Rationale (docs/VEL_v2_plan.md §3.5):
+      * Fixed-α residual update degrades when k>1 because the (sigmoid-era)
+        landscape is non-uniformly convex. The removal of the sigmoid improves
+        curvature but does not eliminate ruggedness.
+      * We normalise the gradient to a unit direction (magnitude was never
+        informative anyway — it was dominated by whichever dim saturated the
+        head), then try several α's plus α=0 and return the one with minimum
+        energy. Including α=0 is what formally guarantees "never worse than
+        BC": the line search can always fall back to the uncorrected action.
+
+    Compute cost: 1 gradient evaluation + len(alphas) energy evaluations
+    (≈ 5 tiny forwards, negligible latency even for π0.5).
+
+    A_bc: numpy [H, Da] or tensor [B,H,Da].
+    Returns numpy [H, Da] in the same gripper convention as the input path.
+    """
+    # ---------- normalise input to [1,H,Da] on h.device, bfloat16 ----------
+    device = h.device
+    dtype = torch.bfloat16
+
+    if isinstance(A_bc, np.ndarray):
+        A0 = torch.tensor(A_bc, dtype=dtype, device=device).unsqueeze(0)
+    else:
+        A0 = A_bc
+        if A0.dim() == 2:
+            A0 = A0.unsqueeze(0)
+        A0 = A0.to(device=device, dtype=dtype)
+
+    B = A0.size(0)
+    assert B == 1, "line_search_energy_correction_seq assumes batch=1."
+
+    # Match the gripper-convention handling of the original correction path.
+    A_base = invert_gripper_action_tensor(normalize_gripper_action_tensor(A0)).detach().clone()
+    A_base[..., -1] = torch.where(A_base[..., -1] == -1, 1, 0)
+
+    # ---------- one gradient evaluation ----------
+    A_grad = A_base.detach().clone().requires_grad_(True)
+    with torch.enable_grad():
+        E_bc = energy_head(h, A_grad, energy_mask)
+        grad_A = torch.autograd.grad(E_bc.sum(), A_grad)[0]   # [1,H,Da]
+
+    if correct_first_only:
+        mask = torch.zeros_like(grad_A); mask[:, 0, :] = 1.0
+        grad_A = grad_A * mask
+
+    # Unit-norm direction — we use magnitude only through α.
+    g_flat = grad_A.reshape(1, -1)
+    g_norm = g_flat.norm(dim=-1, keepdim=True) + 1e-6
+    direction = (grad_A / g_norm.view(1, 1, 1))
+
+    # ---------- build candidate actions, including α=0 ----------
+    cand_list = [A_base - float(a) * direction for a in alphas]   # each [1,H,Da]
+    candidates = torch.cat(cand_list, dim=0).detach()             # [K,H,Da]
+
+    # Broadcast context and mask along the K dimension for one batched forward.
+    K = candidates.size(0)
+    h_rep = h.expand(K, *h.shape[1:]).contiguous()
+    mask_rep = energy_mask
+    if energy_mask is not None:
+        mask_rep = energy_mask.expand(K, *energy_mask.shape[1:]).contiguous()
+
+    energy_head.eval()
+    with torch.no_grad():
+        E_cands = energy_head(h_rep, candidates, mask_rep).view(K)   # [K]
+    energy_head.train()
+
+    best_idx = int(torch.argmin(E_cands).item())
+    A_out = candidates[best_idx:best_idx + 1]
+
+    if verbose:
+        e_list = [f"{float(e):.6f}" for e in E_cands.flatten().tolist()]
+        a_list = list(alphas)
+        print(f"[LineSearch] α={a_list}  E={e_list}  picked α={a_list[best_idx]}")
+
+    return A_out.squeeze(0).detach().cpu().to(torch.float32).numpy()
+
+
 def get_vla_action(
     cfg: Any,
     vla: torch.nn.Module,
@@ -1206,8 +1296,15 @@ def get_vla_action(
             action = model_actions
         
     if cfg.e_decoding:
-        # action = one_step_energy_correction_seq(h_head,hiddens[-1],action,energy_pad_mask)
-        action = k_step_energy_correction_seq(h_head,hiddens[-1],action,energy_pad_mask,cfg.energy_k,alpha=cfg.energy_alpha)
+        # VEL v2 (P1): energy-monitored line-search correction (docs/VEL_v2_plan.md §3.5).
+        # cfg.energy_alpha is still honoured as the *max* α in the line-search grid;
+        # α=0 is always appended so the correction can never be worse than BC.
+        alpha_max = float(getattr(cfg, "energy_alpha", 0.2))
+        alphas = (alpha_max, alpha_max * 0.5, alpha_max * 0.25, 0.0)
+        action = line_search_energy_correction_seq(
+            h_head, hiddens[-1], action, energy_pad_mask,
+            alphas=alphas,
+        )
 
 
 

@@ -181,12 +181,11 @@ class EnergyModel(nn.Module):
         self.pool = SeqPool(mode="mean")
 
 
-        self.T = 30.0               # temperature for energy range
-        
-        self.act = nn.Sigmoid() 
-        # self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden))
-        self.energy_scale = 2.0
-        self.energy_offset = 0.1
+        # VEL v2 (P1): unbounded energy. No sigmoid cap — the previous
+        # Sigmoid * 2.0 + 0.1 dead-zones ∇_a E on hard samples and compresses
+        # InfoNCE logit range, which is why k>1 degrades and BC-neighbourhood
+        # correction is weak. Raw per-step scalar is aggregated by mean pool
+        # at the tail of forward().
     
 
     def forward(self, hN: torch.Tensor, a: torch.Tensor, pad_mask = None, reduce="sum", gamma=None) -> torch.Tensor:
@@ -241,18 +240,11 @@ class EnergyModel(nn.Module):
 
 
         Z, _ = self.cross(query=action_mapped, key=context_mapped, value=context_mapped, need_weights=False, key_padding_mask=pad_mask)
-        # assert_finite(Z, "attn_out")
 
-        energy_feature_step = self.prediction_head(Z)
-        # assert_finite(energy_feature_step, "energy_feature_step")
-
-
-        # raw = self.T * torch.tanh(raw / self.T)
-        energy_feature_step = energy_feature_step * 0.5
-        E = self.act(energy_feature_step) * self.energy_scale + self.energy_offset
-        # assert_finite(E, "E")
-
-        energy_avg = self.pool(E)
+        # Per-step raw energy, unbounded. No sigmoid / scale / offset.
+        # Aggregation: mean over action chunk steps → [B, 1].
+        energy_feature_step = self.prediction_head(Z)     # [B, H, 1]
+        energy_avg = self.pool(energy_feature_step)       # [B, 1]
         assert_finite(energy_avg, "energy_avg")
 
         return energy_avg
@@ -474,7 +466,7 @@ def energy_inbatch_swap_infonce(
     h: torch.Tensor,          # [B,S,D]
     a_pos: torch.Tensor,      # [B,H,Da]
     pad_mask: torch.Tensor,   # [B,S+H]，True=pad
-    tau: float = 0.5,
+    tau: float = 1.0,          # v2: default τ=1.0 (was 0.5 under sigmoid-bounded E)
     reduce_steps: str = "mean",
 ):
     B, S, D = h.shape
@@ -534,3 +526,166 @@ def energy_inbatch_swap_infonce_2d(
     E_neg_mean = E_ij[_offdiag_mask(B, device)].mean() if B > 1 else torch.tensor(0., device=device)
 
     return loss, E_pos_mean, E_neg_mean
+
+
+
+# =============================================================================
+# VEL v2 — P1: unbounded-E InfoNCE + margin ranking + gradient alignment loss
+# =============================================================================
+#
+# Rationale (see docs/VEL_v2_plan.md §1, §3.2):
+#   - InfoNCE with bounded sigmoid-E compresses logit dynamics → weak contrastive
+#     signal. τ is raised to 1.0 once the sigmoid cap is removed.
+#   - Margin ranking directly enforces E(s, a⋆) − E(s, a_neg) ∝ L1(a_neg, a⋆);
+#     this is what the paper's Fig. 5 "energy scales with L1" actually claims,
+#     and the old loss never trained it explicitly.
+#   - GAL closes the train-inference distribution gap: training only ever sees
+#     a⋆, but inference corrects a_BC. By perturbing a⋆ at multiple scales σ
+#     and requiring −∇_a E to align with (a⋆ − a_tilde), we regularise the
+#     gradient field in the neighbourhood where the BC action actually lives.
+
+def _swap_energy_matrix(energy_model, h, a_pos, pad_mask):
+    """Return [B,B] energy matrix E_ij = E(h_i, a_pos_j)."""
+    B, S, D = h.shape
+    H, Da = a_pos.shape[1], a_pos.shape[2]
+    dtype = next(energy_model.parameters()).dtype
+    h_rep = h.to(dtype).unsqueeze(1).expand(B, B, S, D).reshape(B * B, S, D)
+    a_rep = a_pos.to(dtype).unsqueeze(0).expand(B, B, H, Da).reshape(B * B, H, Da)
+    pm = None
+    if pad_mask is not None:
+        pm = pad_mask.unsqueeze(1).expand(B, B, pad_mask.size(1)).reshape(B * B, pad_mask.size(1))
+    return energy_model(h_rep, a_rep, pm).view(B, B, 1).squeeze(-1)   # [B,B]
+
+
+def energy_margin_swap(
+    energy_model,
+    h: torch.Tensor,          # [B,S,D]
+    a_pos: torch.Tensor,      # [B,H,Da]
+    pad_mask: torch.Tensor,   # [B,S+H]
+    beta: float = 2.0,
+):
+    """
+    Margin ranking over in-batch swap negatives.
+
+    For each anchor i, for every j ≠ i:
+        L_ij = max(0,  E(h_i, a_i) − E(h_i, a_j) + β · L1(a_j, a_i) )
+    """
+    B = h.size(0)
+    if B < 2:
+        zero = h.new_zeros(())
+        return zero, zero, zero
+
+    E_ij = _swap_energy_matrix(energy_model, h, a_pos, pad_mask)  # [B,B]
+    E_pos = torch.diag(E_ij)                                       # [B]
+
+    # L1 distance matrix between actions (per-element mean → comparable to β scale).
+    with torch.no_grad():
+        a_i = a_pos.unsqueeze(1)   # [B,1,H,Da]
+        a_j = a_pos.unsqueeze(0)   # [1,B,H,Da]
+        l1_mat = (a_i - a_j).abs().mean(dim=(2, 3))                # [B,B]
+        margin = beta * l1_mat
+
+    # Only off-diagonal entries are negatives.
+    off = _offdiag_mask(B, h.device)
+    loss = F.relu(E_pos.unsqueeze(1) - E_ij + margin)[off].mean()
+
+    E_pos_mean = E_pos.mean()
+    E_neg_mean = E_ij[off].mean()
+    return loss, E_pos_mean, E_neg_mean
+
+
+def gradient_alignment_loss(
+    energy_model,
+    h: torch.Tensor,          # [B,S,D]
+    a_pos: torch.Tensor,      # [B,H,Da]
+    pad_mask: torch.Tensor,   # [B,S+H]
+    sigmas=(0.05, 0.15, 0.30),
+):
+    """
+    Multi-scale gradient alignment (see plan §3.2).
+
+    For each σ:
+        ã = a⋆ + N(0, σ²)
+        g = ∇_ã E(h, ã)
+        minimise  − cos(−g, a⋆ − ã)
+
+    create_graph=True is required so second-order gradients flow back into
+    the energy head's parameters. We run this in fp32 to keep the
+    double-backward numerically stable; callers should guard with
+    `torch.cuda.amp.autocast(enabled=False)` just as they already do for
+    the InfoNCE loss.
+    """
+    dtype = next(energy_model.parameters()).dtype
+    h_f = h.to(dtype)
+    a_f = a_pos.to(dtype)
+
+    total = h.new_zeros(())
+    cos_sum = h.new_zeros(())
+    for sigma in sigmas:
+        eps = torch.randn_like(a_f) * sigma
+        a_tilde = (a_f + eps).detach().clone().requires_grad_(True)
+
+        E = energy_model(h_f, a_tilde, pad_mask).sum()
+        g = torch.autograd.grad(E, a_tilde, create_graph=True)[0]   # [B,H,Da]
+
+        target = (a_f - a_tilde).detach()
+        g_flat = (-g).reshape(g.size(0), -1)
+        t_flat = target.reshape(target.size(0), -1)
+        cos = F.cosine_similarity(g_flat, t_flat, dim=-1)           # [B]
+
+        total = total - cos.mean()
+        cos_sum = cos_sum + cos.mean().detach()
+
+    total = total / len(sigmas)
+    cos_mean = cos_sum / len(sigmas)
+    return total, cos_mean
+
+
+def vel_v2_energy_loss(
+    energy_model,
+    h: torch.Tensor,
+    a_pos: torch.Tensor,
+    pad_mask: torch.Tensor,
+    tau: float = 1.0,
+    beta_margin: float = 2.0,
+    lambda_margin: float = 1.0,
+    lambda_gal: float = 0.1,
+    gal_sigmas=(0.05, 0.15, 0.30),
+    enable_gal: bool = True,
+):
+    """
+    Composite VEL v2 (P1) energy loss.
+
+    L_total = L_nce + λ_margin · L_margin + λ_gal · L_gal
+
+    All three losses share the same swap negatives in P1. In P2, structured
+    (temporal / amplitude / directional) negatives will replace the swap.
+
+    Returns:
+        total, dict of individual terms & running-means for logging.
+    """
+    l_nce, e_pos, e_neg = energy_inbatch_swap_infonce(
+        energy_model, h, a_pos, pad_mask, tau=tau
+    )
+    l_margin, _, _ = energy_margin_swap(
+        energy_model, h, a_pos, pad_mask, beta=beta_margin
+    )
+
+    if enable_gal:
+        l_gal, gal_cos = gradient_alignment_loss(
+            energy_model, h, a_pos, pad_mask, sigmas=gal_sigmas
+        )
+    else:
+        l_gal = h.new_zeros(())
+        gal_cos = h.new_zeros(())
+
+    total = l_nce + lambda_margin * l_margin + lambda_gal * l_gal
+
+    return total, {
+        "L_nce": l_nce.detach(),
+        "L_margin": l_margin.detach(),
+        "L_gal": l_gal.detach(),
+        "GAL_cos": gal_cos.detach(),
+        "E_pos": e_pos.detach(),
+        "E_neg": e_neg.detach(),
+    }

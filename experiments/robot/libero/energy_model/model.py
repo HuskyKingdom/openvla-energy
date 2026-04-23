@@ -181,12 +181,8 @@ class EnergyModel(nn.Module):
         self.pool = SeqPool(mode="mean")
 
 
-        self.T = 30.0               # temperature for energy range
-        
-        self.act = nn.Sigmoid() 
-        # self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden))
-        self.energy_scale = 2.0
-        self.energy_offset = 0.1
+        # VEL v2 (P1): unbounded energy. See vla-scripts/energy/energy_model.py
+        # for rationale. Must match training-side definition for checkpoint loading.
     
 
     def forward(self, hN: torch.Tensor, a: torch.Tensor, pad_mask = None, reduce="sum", gamma=None) -> torch.Tensor:
@@ -241,18 +237,9 @@ class EnergyModel(nn.Module):
 
 
         Z, _ = self.cross(query=action_mapped, key=context_mapped, value=context_mapped, need_weights=False, key_padding_mask=pad_mask)
-        # assert_finite(Z, "attn_out")
 
-        energy_feature_step = self.prediction_head(Z)
-        # assert_finite(energy_feature_step, "energy_feature_step")
-
-
-        # raw = self.T * torch.tanh(raw / self.T)
-        energy_feature_step = energy_feature_step * 0.5
-        E = self.act(energy_feature_step) * self.energy_scale + self.energy_offset
-        # assert_finite(E, "E")
-
-        energy_avg = self.pool(E)
+        energy_feature_step = self.prediction_head(Z)     # [B, H, 1]
+        energy_avg = self.pool(energy_feature_step)       # [B, 1]
         assert_finite(energy_avg, "energy_avg")
 
         return energy_avg

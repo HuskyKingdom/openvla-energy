@@ -66,7 +66,15 @@ from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # energy
-from energy.energy_model import EnergyModel, compute_negative_energy, energy_infonce_loss, get_negatives, energy_inbatch_swap_infonce_2d, energy_inbatch_swap_infonce
+from energy.energy_model import (
+    EnergyModel,
+    compute_negative_energy,
+    energy_infonce_loss,
+    get_negatives,
+    energy_inbatch_swap_infonce_2d,
+    energy_inbatch_swap_infonce,
+    vel_v2_energy_loss,
+)
 
 @dataclass
 class FinetuneConfig:
@@ -497,9 +505,22 @@ def run_forward_pass(
         energy_mask = context_mask
 
         with torch.cuda.amp.autocast(enabled=False):
-
-            swap_loss, E_pos_mean, E_neg_mean = energy_inbatch_swap_infonce(energy_model,context_hidden,ground_truth_actions, energy_mask)
-            energy_loss = swap_loss
+            # VEL v2 (P1): unbounded-E InfoNCE + margin ranking + multi-scale GAL.
+            # GAL requires a double-backward so it must stay outside autocast.
+            energy_loss, energy_terms = vel_v2_energy_loss(
+                energy_model,
+                context_hidden,
+                ground_truth_actions,
+                energy_mask,
+                tau=1.0,
+                beta_margin=2.0,
+                lambda_margin=1.0,
+                lambda_gal=0.1,
+                gal_sigmas=(0.05, 0.15, 0.30),
+                enable_gal=True,
+            )
+            E_pos_mean = energy_terms["E_pos"]
+            E_neg_mean = energy_terms["E_neg"]
 
 
 
@@ -561,6 +582,10 @@ def run_forward_pass(
                     "energy_loss": energy_loss.item(),
                     "Positive_Energy": E_pos_mean.item(),
                     "Negative_Energy": E_neg_mean.item(),
+                    "L_nce": energy_terms["L_nce"].item(),
+                    "L_margin": energy_terms["L_margin"].item(),
+                    "L_gal": energy_terms["L_gal"].item(),
+                    "GAL_cos": energy_terms["GAL_cos"].item(),
                 }
             )
 
@@ -1163,6 +1188,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         "energy_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "Positive_Energy": deque(maxlen=cfg.grad_accumulation_steps),
         "Negative_Energy": deque(maxlen=cfg.grad_accumulation_steps),
+        "L_nce": deque(maxlen=cfg.grad_accumulation_steps),
+        "L_margin": deque(maxlen=cfg.grad_accumulation_steps),
+        "L_gal": deque(maxlen=cfg.grad_accumulation_steps),
+        "GAL_cos": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
     # Start training
