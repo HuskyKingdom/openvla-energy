@@ -1179,6 +1179,21 @@ def get_vla_action(
                         action_head=action_head,
                         use_film=use_film,
                     )
+                    # When the loaded VLA comes from an upstream checkpoint whose
+                    # predict_action only returns (action, hiddens), synthesise the
+                    # missing pieces so downstream energy correction still works.
+                    # Mask is rebuilt using the same convention as training
+                    # (patch=attend, action/EOS=masked out).
+                    layer_actions = None
+                    num_patches_now = (
+                        vla.vision_backbone.get_num_patches()
+                        * vla.vision_backbone.get_num_images_in_input()
+                    )
+                    if cfg.use_proprio:
+                        num_patches_now += 1
+                    energy_pad_mask = get_context_mask_for_inference(
+                        hiddens[-1], action_head, num_patches_now
+                    )
 
         # End timing for VLA forward pass
         if torch.cuda.is_available():
