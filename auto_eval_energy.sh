@@ -10,8 +10,14 @@ echo "Running Evaluations Automatically ------------------------------"
 
 PRETRAINED_CKPT=moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10
 ENERGY_CKPT=ckpoints/energy_model--50000_checkpoint.pt
-ENERGY_ALPHA=0.2
+ENERGY_ALPHA=0
 RUN_TAG=velv2_p1_50k
+
+# Timing profile switch — 1 = print rolling VLA / energy / total latency stats.
+# Leave at 0 for real SR runs (sync() kills GPU pipelining and inflates wall time).
+export VEL_TIMING_PROFILE=0
+export VEL_TIMING_LOG_EVERY=50
+export VEL_TIMING_WINDOW=200
 
 echo "Evaluating spatial ------------------------------"
 echo N | python experiments/robot/libero/run_libero_eval.py \

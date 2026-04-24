@@ -25,6 +25,57 @@ json_numpy.patch()
 # Global flag for FLOPs calculation (only compute once)
 _FLOPS_CALCULATED = False
 
+# ---------------------------------------------------------------------------
+# Timing profile switch.
+#
+# Enable with env var `VEL_TIMING_PROFILE=1` (or any truthy). When on, the
+# inference loop measures three things per step:
+#   (a) VLA forward (predict_action)
+#   (b) energy correction (line-search, only when cfg.e_decoding=True)
+#   (c) total get_vla_action
+# and prints rolling stats (last N calls: mean / p50 / p95) every
+# `VEL_TIMING_LOG_EVERY` steps (default 50).
+#
+# Also controls whether the one-shot FLOPs summary prints. When timing is OFF,
+# both per-step prints and the FLOPs block are silenced.
+# ---------------------------------------------------------------------------
+_TIMING_ENABLED = os.environ.get("VEL_TIMING_PROFILE", "0").lower() in ("1", "true", "yes", "on")
+_TIMING_LOG_EVERY = int(os.environ.get("VEL_TIMING_LOG_EVERY", "50"))
+_TIMING_WINDOW = int(os.environ.get("VEL_TIMING_WINDOW", "200"))
+_timing_buffers = {"vla": [], "energy": [], "total": []}
+_timing_step = 0
+
+
+def _timing_record_and_maybe_log(vla_ms: float, energy_ms: float, total_ms: float) -> None:
+    """Push one sample into the rolling window and print stats every N calls."""
+    if not _TIMING_ENABLED:
+        return
+    global _timing_step
+    for key, val in (("vla", vla_ms), ("energy", energy_ms), ("total", total_ms)):
+        buf = _timing_buffers[key]
+        buf.append(val)
+        if len(buf) > _TIMING_WINDOW:
+            del buf[0]
+    _timing_step += 1
+    if _timing_step % _TIMING_LOG_EVERY != 0:
+        return
+
+    def _fmt(buf):
+        if not buf:
+            return "n/a"
+        import statistics
+        mean = statistics.fmean(buf)
+        p50 = statistics.median(buf)
+        p95 = sorted(buf)[max(0, int(0.95 * len(buf)) - 1)]
+        return f"mean={mean:6.2f}ms  p50={p50:6.2f}ms  p95={p95:6.2f}ms"
+
+    print(
+        f"[TIMING step={_timing_step} n={len(_timing_buffers['total'])}] "
+        f"vla: {_fmt(_timing_buffers['vla'])} | "
+        f"energy: {_fmt(_timing_buffers['energy'])} | "
+        f"total: {_fmt(_timing_buffers['total'])}"
+    )
+
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
@@ -1144,10 +1195,11 @@ def get_vla_action(
             obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
             proprio = obs["state"]
 
-        # Start timing for VLA forward pass
-        if torch.cuda.is_available():
+        # Start timing (gated by VEL_TIMING_PROFILE)
+        if _TIMING_ENABLED and torch.cuda.is_available():
             torch.cuda.synchronize()
-        vla_start_time = time.time()
+        step_start_time = time.time() if _TIMING_ENABLED else None
+        vla_start_time = step_start_time
 
         # Generate action
         if action_head is None:
@@ -1205,19 +1257,14 @@ def get_vla_action(
                         hiddens[-1], action_head, num_patches_now
                     )
 
-        # End timing for VLA forward pass
-        if torch.cuda.is_available():
+        # End timing for VLA forward pass (gated)
+        if _TIMING_ENABLED and torch.cuda.is_available():
             torch.cuda.synchronize()
-        vla_end_time = time.time()
-        vla_elapsed_time = (vla_end_time - vla_start_time) * 1000  # Convert to ms
-        
-        # Print VLA forward pass timing
-        # print(f"\n{'='*80}")
-        # print(f"[TIMING] VLA Forward Pass: {vla_elapsed_time:.2f} ms ({vla_elapsed_time/1000:.4f} s)")
-        # print(f"{'='*80}\n")
-        
-        # Calculate FLOPs only once
-        if not _FLOPS_CALCULATED:
+        vla_end_time = time.time() if _TIMING_ENABLED else None
+        vla_elapsed_time = ((vla_end_time - vla_start_time) * 1000) if _TIMING_ENABLED else 0.0
+
+        # Calculate FLOPs only once (also gated — FLOPs summary only interesting while profiling)
+        if _TIMING_ENABLED and not _FLOPS_CALCULATED:
             try:
                 from thop import profile, clever_format
                 
@@ -1320,6 +1367,11 @@ def get_vla_action(
 
             action = model_actions
         
+    # Start energy-correction timing (gated)
+    if _TIMING_ENABLED and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    energy_start_time = time.time() if _TIMING_ENABLED else None
+
     if cfg.e_decoding:
         # VEL v2 (P1): energy-monitored line-search correction (docs/VEL_v2_plan.md §3.5).
         # cfg.energy_alpha is still honoured as the *max* α in the line-search grid;
@@ -1331,8 +1383,14 @@ def get_vla_action(
             alphas=alphas,
         )
 
-
-
+    # End energy-correction timing + emit rolling stats
+    if _TIMING_ENABLED:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        step_end_time = time.time()
+        energy_elapsed_time = (step_end_time - energy_start_time) * 1000
+        total_elapsed_time = (step_end_time - step_start_time) * 1000
+        _timing_record_and_maybe_log(vla_elapsed_time, energy_elapsed_time, total_elapsed_time)
 
     # Return action chunk as list of actions
     return [action[i] for i in range(len(action))]
