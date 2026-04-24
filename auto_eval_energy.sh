@@ -1,28 +1,50 @@
 #!/bin/bash
 
-# without energy
-echo "Running Evaluations Automatically ------------------------------"
-FARM_USER=sgyson10
+# VEL v2 (P1) · eval run: vel_gal_multiscale / 50000 step
+# - Base VLA & action head & proprio projector: HF hub (training was freeze-mode,
+#   so these are identical to the upstream moojink checkpoint).
+# - Energy head: loaded from our training run_root_dir via --energy_ckpt.
+# - energy_alpha=0.2 = α_max; line-search grid becomes (0.2, 0.1, 0.05, 0.0).
 
+echo "Running Evaluations Automatically ------------------------------"
+
+PRETRAINED_CKPT=moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10
+ENERGY_CKPT=/work1/chunyilee/yuhang/openvla-energy/openvla-7b-oft-finetuned-libero-spatial-object-goal-10+libero_4_task_suites_no_noops+b8+lr-0.0005+lora-r32+dropout-0.0--image_aug--vel_gal_multiscale--50000_chkpt/energy_model--50000_checkpoint.pt
+ENERGY_ALPHA=0.2
+RUN_TAG=velv2_p1_50k
 
 echo "Evaluating spatial ------------------------------"
 echo N | python experiments/robot/libero/run_libero_eval.py \
-    --pretrained_checkpoint /home/aup/YuhangWorkspace/openvla-oft-yhs/ckpts/pre-trained \
-    --task_suite_name libero_spatial --e_decoding True --task_label w_energy_spatial_0.3
+    --pretrained_checkpoint $PRETRAINED_CKPT \
+    --energy_ckpt           $ENERGY_CKPT \
+    --task_suite_name       libero_spatial \
+    --e_decoding            True \
+    --energy_alpha          $ENERGY_ALPHA \
+    --task_label            ${RUN_TAG}_spatial
 
 echo "Evaluating object ------------------------------"
 echo N | python experiments/robot/libero/run_libero_eval.py \
-    --pretrained_checkpoint /home/aup/YuhangWorkspace/openvla-oft-yhs/ckpts/pre-trained \
-    --task_suite_name libero_object --e_decoding True --task_label w_energy_object_0.3
+    --pretrained_checkpoint $PRETRAINED_CKPT \
+    --energy_ckpt           $ENERGY_CKPT \
+    --task_suite_name       libero_object \
+    --e_decoding            True \
+    --energy_alpha          $ENERGY_ALPHA \
+    --task_label            ${RUN_TAG}_object
 
 echo "Evaluating goal ------------------------------"
 echo N | python experiments/robot/libero/run_libero_eval.py \
-    --pretrained_checkpoint /home/aup/YuhangWorkspace/openvla-oft-yhs/ckpts/pre-trained \
-    --task_suite_name libero_goal --e_decoding True --task_label w_energy_goal_0.3
+    --pretrained_checkpoint $PRETRAINED_CKPT \
+    --energy_ckpt           $ENERGY_CKPT \
+    --task_suite_name       libero_goal \
+    --e_decoding            True \
+    --energy_alpha          $ENERGY_ALPHA \
+    --task_label            ${RUN_TAG}_goal
 
 echo "Evaluating long ------------------------------"
 echo N | python experiments/robot/libero/run_libero_eval.py \
-    --pretrained_checkpoint /home/aup/YuhangWorkspace/openvla-oft-yhs/ckpts/pre-trained \
-    --task_suite_name libero_10 --e_decoding True --task_label w_energy_10_0.3
-
-
+    --pretrained_checkpoint $PRETRAINED_CKPT \
+    --energy_ckpt           $ENERGY_CKPT \
+    --task_suite_name       libero_10 \
+    --e_decoding            True \
+    --energy_alpha          $ENERGY_ALPHA \
+    --task_label            ${RUN_TAG}_long

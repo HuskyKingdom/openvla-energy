@@ -138,6 +138,11 @@ class GenerateConfig:
     remove_wrap:bool = False
     energy_k:int = 1
     energy_alpha:float = 0.5
+    # Explicit path to the energy head checkpoint (.pt). If empty, falls back
+    # to the legacy hardcoded path below for backward compat. Needed when the
+    # training run was done in freeze mode (so the VLA base is loaded from HF
+    # hub while the energy head lives in a separate run_root_dir).
+    energy_ckpt:str = ""
 
     # fmt: on
 
@@ -446,7 +451,13 @@ def run_task(
         # loading energy model
         if cfg.e_decoding:
             hnn_potential_mlp_head = EnergyModel(model.llm_dim,7).to(model.device)
-            hnn_potential_mlp_head.load_state_dict(torch.load("/home/aup/YuhangWorkspace/openvla-oft-yhs/ckpts/energy_refined_80000.pt"))
+            energy_ckpt_path = (
+                cfg.energy_ckpt
+                if cfg.energy_ckpt
+                else "/home/aup/YuhangWorkspace/openvla-oft-yhs/ckpts/energy_refined_80000.pt"
+            )
+            print(f"[eval] Loading energy head from: {energy_ckpt_path}")
+            hnn_potential_mlp_head.load_state_dict(torch.load(energy_ckpt_path, map_location=model.device))
         else:
             hnn_potential_mlp_head = None
 
