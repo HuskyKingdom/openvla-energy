@@ -10,7 +10,7 @@ echo "Running Evaluations Automatically ------------------------------"
 
 PRETRAINED_CKPT=moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10
 ENERGY_CKPT=ckpoints/energy_model--50000_checkpoint.pt
-ENERGY_ALPHA=0
+ENERGY_ALPHA=0.2
 RUN_TAG=velv2_p1_50k
 
 # Timing profile switch — 1 = print rolling VLA / energy / total latency stats.
