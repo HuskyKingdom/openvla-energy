@@ -1,10 +1,11 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(python3 -c 'import ast *)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('experiments/robot/openvla_utils.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+    ],
     "additionalDirectories": [
       "/home/yuhang/Desktop/oft-workspace/openvla-energy"
-    ],
-    "allow": [
-      "Bash(python3 -c 'import ast *)"
     ]
   }
 }

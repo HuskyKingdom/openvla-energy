@@ -15,7 +15,7 @@ import requests
 import tensorflow as tf
 import torch
 import torch.nn.functional as F
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from PIL import Image
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
@@ -313,25 +313,35 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     """
     print("Instantiating pretrained VLA policy...")
 
-    # If loading a locally stored pretrained checkpoint, check whether config or model files
-    # need to be synced so that any changes the user makes to the VLA modeling code will
-    # actually go into effect
-    # If loading a pretrained checkpoint from Hugging Face Hub, we just assume that the policy
-    # will be used as is, with its original modeling logic
-    if not model_is_on_hf_hub(cfg.pretrained_checkpoint):
-        # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
-        AutoConfig.register("openvla", OpenVLAConfig)
-        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+    # If the checkpoint id points at HF hub, snapshot it to the local HF cache
+    # so we can treat it as a local path from here on. This is important because
+    # when `trust_remote_code=True` is used with a hub id, HF will download and
+    # run the hub's `modeling_prismatic.py` — which is the upstream version and
+    # has a *different `predict_action` signature* (2-tuple vs our 4-tuple).
+    # Routing through a local snapshot lets `update_auto_map` + the Auto-class
+    # registrations below force our local modeling code to be used instead,
+    # keeping train/eval consistent.
+    local_checkpoint_path = cfg.pretrained_checkpoint
+    if model_is_on_hf_hub(cfg.pretrained_checkpoint):
+        print(f"Snapshotting HF hub model '{cfg.pretrained_checkpoint}' to local cache...")
+        local_checkpoint_path = snapshot_download(
+            repo_id=cfg.pretrained_checkpoint,
+        )
+        print(f"  → local path: {local_checkpoint_path}")
 
-        # Update config.json and sync model files
-        update_auto_map(cfg.pretrained_checkpoint)
-        check_model_logic_mismatch(cfg.pretrained_checkpoint)
+    # Register OpenVLA model to HF Auto Classes
+    AutoConfig.register("openvla", OpenVLAConfig)
+    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
-    # Load the model
+    # Update config.json and sync model files so HF uses our local modeling code.
+    update_auto_map(local_checkpoint_path)
+    check_model_logic_mismatch(local_checkpoint_path)
+
+    # Load the model (from local path, not the original hub id)
     vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.pretrained_checkpoint,
+        local_checkpoint_path,
         # attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
@@ -353,8 +363,8 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     if not cfg.load_in_8bit and not cfg.load_in_4bit:
         vla = vla.to(DEVICE)
 
-    # Load dataset stats for action normalization
-    _load_dataset_stats(vla, cfg.pretrained_checkpoint)
+    # Load dataset stats for action normalization (use local snapshot path)
+    _load_dataset_stats(vla, local_checkpoint_path)
 
     return vla
 
