@@ -19,6 +19,9 @@ DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
+# Mirror the timing switch used in openvla_utils.py (VEL_TIMING_PROFILE env var).
+_TIMING_ENABLED = os.environ.get("VEL_TIMING_PROFILE", "0").lower() in ("1", "true", "yes", "on")
+
 # Configure NumPy print settings
 np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
 
@@ -128,11 +131,11 @@ def get_action(
     Raises:
         ValueError: If model family is not supported
     """
-    # Start timing for get_action
-    if torch.cuda.is_available():
+    # Start timing (gated by VEL_TIMING_PROFILE — same switch as openvla_utils).
+    if _TIMING_ENABLED and torch.cuda.is_available():
         torch.cuda.synchronize()
-    start_time = time.time()
-    
+    start_time = time.time() if _TIMING_ENABLED else None
+
     with torch.no_grad():
         if cfg.model_family == "openvla":
             action = get_vla_action(
@@ -149,16 +152,14 @@ def get_action(
             )
         else:
             raise ValueError(f"Unsupported model family: {cfg.model_family}")
-    
-    # End timing and print results
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    end_time = time.time()
-    elapsed_time = (end_time - start_time) * 1000  # Convert to ms
-    
-    print(f"{'='*80}")
-    print(f"[TIMING] get_action: {elapsed_time:.2f} ms ({elapsed_time/1000:.4f} s)")
-    print(f"{'='*80}")
+
+    if _TIMING_ENABLED:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed_time = (time.time() - start_time) * 1000
+        print(f"{'='*80}")
+        print(f"[TIMING] get_action: {elapsed_time:.2f} ms ({elapsed_time/1000:.4f} s)")
+        print(f"{'='*80}")
 
     return action
 
