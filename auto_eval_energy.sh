@@ -9,7 +9,7 @@
 echo "Running Evaluations Automatically ------------------------------"
 
 PRETRAINED_CKPT=moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10
-ENERGY_CKPT=/work1/chunyilee/yuhang/openvla-energy/openvla-7b-oft-finetuned-libero-spatial-object-goal-10+libero_4_task_suites_no_noops+b8+lr-0.0005+lora-r32+dropout-0.0--image_aug--vel_gal_multiscale--50000_chkpt/energy_model--50000_checkpoint.pt
+ENERGY_CKPT=ckpoints/energy_model--50000_checkpoint.pt
 ENERGY_ALPHA=0.2
 RUN_TAG=velv2_p1_50k
 
