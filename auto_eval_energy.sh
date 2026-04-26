@@ -10,9 +10,9 @@ echo "Running Evaluations Automatically ------------------------------"
 
 PRETRAINED_CKPT=moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10
 ENERGY_CKPT=ckpoints/energy_model--50000_checkpoint.pt
-ENERGY_ALPHA=0
-E_DECODING=False
-RUN_TAG=raw_eval
+ENERGY_ALPHA=0.2
+E_DECODING=True
+RUN_TAG=v2_p1_alpha_0.2
 
 # Timing profile switch — 1 = print rolling VLA / energy / total latency stats.
 # Leave at 0 for real SR runs (sync() kills GPU pipelining and inflates wall time).
