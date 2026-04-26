@@ -569,7 +569,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
 
     # saving results
-    with open(f"/home/aup/YuhangWorkspace/openvla-oft-yhs/ckpts/{cfg.task_label}.txt", "w", encoding="utf-8") as f:
+    with open(f"/home/yuhang/Warehouse/Yuhangworkspace/openvla-energy/ckpts/{cfg.task_label}.txt", "w", encoding="utf-8") as f:
         f.write(f"{final_success_rate:.4f}")  
 
     # Log to wandb if enabled
