@@ -25,6 +25,7 @@ echo N | python experiments/robot/libero/run_libero_eval.py \
     --pretrained_checkpoint $PRETRAINED_CKPT \
     --energy_ckpt           $ENERGY_CKPT \
     --task_suite_name       libero_spatial \
+    --unnorm_key            libero_spatial_no_noops \
     --e_decoding            $E_DECODING \
     --energy_alpha          $ENERGY_ALPHA \
     --task_label            ${RUN_TAG}_spatial
@@ -34,6 +35,7 @@ echo N | python experiments/robot/libero/run_libero_eval.py \
     --pretrained_checkpoint $PRETRAINED_CKPT \
     --energy_ckpt           $ENERGY_CKPT \
     --task_suite_name       libero_object \
+    --unnorm_key            libero_object_no_noops \
     --e_decoding            $E_DECODING \
     --energy_alpha          $ENERGY_ALPHA \
     --task_label            ${RUN_TAG}_object
@@ -43,6 +45,7 @@ echo N | python experiments/robot/libero/run_libero_eval.py \
     --pretrained_checkpoint $PRETRAINED_CKPT \
     --energy_ckpt           $ENERGY_CKPT \
     --task_suite_name       libero_goal \
+    --unnorm_key            libero_goal_no_noops \
     --e_decoding            $E_DECODING \
     --energy_alpha          $ENERGY_ALPHA \
     --task_label            ${RUN_TAG}_goal
@@ -52,6 +55,7 @@ echo N | python experiments/robot/libero/run_libero_eval.py \
     --pretrained_checkpoint $PRETRAINED_CKPT \
     --energy_ckpt           $ENERGY_CKPT \
     --task_suite_name       libero_10 \
+    --unnorm_key            libero_10_no_noops \
     --e_decoding            $E_DECODING \
     --energy_alpha          $ENERGY_ALPHA \
     --task_label            ${RUN_TAG}_long
