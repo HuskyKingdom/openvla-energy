@@ -12,7 +12,12 @@ PRETRAINED_CKPT=moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10
 ENERGY_CKPT=ckpoints/energy_model--50000_checkpoint.pt
 ENERGY_ALPHA=0.2
 E_DECODING=True
-RUN_TAG=v2_p1_alpha_0.2
+# Path A (docs/VEL_v2_progress.md 2026-04-27): zero gripper dim of energy gradient
+# in line-search. True = default, fixes the catastrophic SR collapse on
+# gripper-heavy suites (object/long). Set False to reproduce the
+# "w/o gripper-skip" ablation row.
+ENERGY_SKIP_GRIPPER=True
+RUN_TAG=v2_p1_alpha_0.2_skipgripper
 
 # Timing profile switch — 1 = print rolling VLA / energy / total latency stats.
 # Leave at 0 for real SR runs (sync() kills GPU pipelining and inflates wall time).
@@ -28,6 +33,7 @@ echo N | python experiments/robot/libero/run_libero_eval.py \
     --unnorm_key            libero_spatial_no_noops \
     --e_decoding            $E_DECODING \
     --energy_alpha          $ENERGY_ALPHA \
+    --energy_skip_gripper   $ENERGY_SKIP_GRIPPER \
     --task_label            ${RUN_TAG}_spatial
 
 echo "Evaluating object ------------------------------"
@@ -38,6 +44,7 @@ echo N | python experiments/robot/libero/run_libero_eval.py \
     --unnorm_key            libero_object_no_noops \
     --e_decoding            $E_DECODING \
     --energy_alpha          $ENERGY_ALPHA \
+    --energy_skip_gripper   $ENERGY_SKIP_GRIPPER \
     --task_label            ${RUN_TAG}_object
 
 echo "Evaluating goal ------------------------------"
@@ -48,6 +55,7 @@ echo N | python experiments/robot/libero/run_libero_eval.py \
     --unnorm_key            libero_goal_no_noops \
     --e_decoding            $E_DECODING \
     --energy_alpha          $ENERGY_ALPHA \
+    --energy_skip_gripper   $ENERGY_SKIP_GRIPPER \
     --task_label            ${RUN_TAG}_goal
 
 echo "Evaluating long ------------------------------"
@@ -58,4 +66,5 @@ echo N | python experiments/robot/libero/run_libero_eval.py \
     --unnorm_key            libero_10_no_noops \
     --e_decoding            $E_DECODING \
     --energy_alpha          $ENERGY_ALPHA \
+    --energy_skip_gripper   $ENERGY_SKIP_GRIPPER \
     --task_label            ${RUN_TAG}_long

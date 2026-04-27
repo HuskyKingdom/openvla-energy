@@ -4,6 +4,100 @@
 
 ---
 
+## 2026-04-27 · P1 eval 结果 → 灾难性退化诊断 → 路径 A/B/C 决策
+
+### Eval 结果
+
+| Suite | α=0（≈BC） | α=0.2（VEL v2 P1） | Δ |
+|---|---|---|---|
+| spatial | **92.6** | 83.8 | **−8.8** |
+| object | **98.8** | 41.8 | **−57.0** ⚠ |
+| goal | **96.4** | 77.6 | **−18.8** |
+| 10 (long) | **94.6** | 33.0 | **−61.6** ⚠ |
+
+α=0 数字与原 paper Table 1（96.2 / 98.3 / 96.2 / 90.7）大致对得上，证明 **BC 链路健康**。
+α=0.2 下能量校正**主动 push 动作变差**，object/long 灾难性。
+
+### 训练曲线（Run#3，50k）
+
+`L_nce ≈ 0.36`、`L_margin ≈ 0.04`、`GAL_cos ≈ 0.39`、E_pos = −32 / E_neg = −9（gap≈23）。
+**所有 P1 success criteria 都达成了**，但 SR 反而崩 → 训练目标与 SR 脱钩。
+
+### 根因：gripper 维度污染（异质性是关键证据）
+
+按 "gripper 操作密度" 重排 SR 退化：
+
+| Suite | gripping 事件密度 | Δ |
+|---|---|---|
+| spatial | 低 | −8.8 |
+| object | 高（精确抓取） | **−57.0** |
+| goal | 中 | −18.8 |
+| long | 极高（链式 pick & place） | **−61.6** |
+
+**Δ 严重程度严格单调对应 gripper 密度**，不是巧合。
+
+物理机制：
+1. 能量头训练时 **gripper 取值 ∈ {0, 1}**（expert 二值 + GAL σ≤0.15 的轻微噪声）
+2. 推理时 line-search 会跨过这个 ball 边界，gripper 在 (0.2, 0.8) 中段值是**未定义外插区**
+3. `g = ∇_a E` 在 gripper 维度往往数值最大（外插行为不规则），**单位化后 gripper 主导 direction**
+4. α=0.2 把 gripper 推到 ~0.3–0.5，进入外插区
+5. argmin 在外插区**几乎随机选**，落进 spurious basin → 错误 gripper 输出 → 抓取失败
+
+### 三条下一步路径
+
+#### **路径 A · 紧急 patch（半小时，零重训）**
+
+不动模型不动训练，**只在 line-search 推理时把 gripper 维度的 gradient 强制置 0**：
+
+```python
+g = ∇_a E(h, a_BC)
+g[..., -1] = 0          # 不让 gripper 参与 unit direction
+direction = g / (||g|| + ε)
+```
+
+效果预测：
+- object 41.8 → ~95%+（彻底切断中毒源）
+- long 33.0 → ~93%+
+- spatial / goal 接近或微高于 α=0 baseline
+
+诊断价值：直接量化 "gripper 是不是真凶"。
+- 如果 patch 后 SR 回 baseline 但不超 → P1 实质失败，跳过 B 直接上 C
+- 如果回 baseline + 0.5–2% → P1 部分成功，可选 B 优化或进 C
+
+#### **路径 B · 加 acceptance gate（一天，零重训）**
+
+给 line-search 加保守接受准则：
+
+```
+E_corrected < E_BC − τ·L1(corrected, BC)
+AND  ‖corrected − BC‖_∞ < δ
+```
+
+τ ≈ 0.5、δ ≈ 0.05。同时屏蔽 gripper 中毒和 pose 维度上的 spurious basin。
+**实验价值**：trust-region size vs SR 是一组好的 ablation 行。
+
+#### **路径 C · 直接 P2 + gripper decouple（3 天，重训）**
+
+对应 plan §3.1 + §3.4：
+- **Structured negatives (N1–N5)** 替换 swap → 能量场在 BC-error 方向被显式监督
+- **Gripper decouple** → 能量头分两支，gripper 走 argmin{E(g=0), E(g=1)}
+
+预期：LIBERO-Long 94.6 → 96.5+。
+
+### 决策
+
+**先做路径 A**。两条理由：
+1. 半小时即可拿到诊断信息，确认/证伪 gripper 假设。结论直接影响 P2 (§3.4) 的优先级。
+2. 即使 P1 整体不成功，路径 A 后的数字仍能写进 paper 当 ablation 行（"w/o gripper-skip"）。
+
+### 风险 & Open Questions（持续）
+
+- **训练目标和 SR 的脱钩**是 P2 设计警钟。P2 必须同时实现 plan §3.6 landscape monitor，**用 held-out rank-correlation 替代 GAL_cos** 做主早停指标。
+- **能量绝对值漂移**：Run#1 / #2 / #3 的 E_pos 各不同（−4 / +211 / −32），loss 缺 absolute anchor。P2 加 `λ_anchor · E_pos²` (λ≈0.001) 把 E 拉到 0 附近，对 trust-region 阈值设定关键。
+- **GAL_cos = 0.4 天花板**仍待 P2 验证。P2 后 GAL_cos > 0.5 是 capacity 不需 scale up 的证据；≤ 0.45 才考虑 §3.x 的多层 cross-attn。
+
+---
+
 ## 2026-04-24 · P1 run#1 诊断 → 超参调整
 
 ### Run#1 结果（wandb run `vel_gal_multiscale`, 5220 steps）

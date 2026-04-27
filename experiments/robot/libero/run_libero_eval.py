@@ -143,6 +143,10 @@ class GenerateConfig:
     # training run was done in freeze mode (so the VLA base is loaded from HF
     # hub while the energy head lives in a separate run_root_dir).
     energy_ckpt:str = ""
+    # Path A (docs/VEL_v2_progress.md 2026-04-27): zero gripper dim of the
+    # energy gradient before line-search. Default on. Set False to reproduce
+    # the catastrophic-collapse ablation row.
+    energy_skip_gripper:bool = True
 
     # fmt: on
 

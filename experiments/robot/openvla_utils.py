@@ -1040,6 +1040,7 @@ def line_search_energy_correction_seq(
     energy_mask,
     alphas=(0.2, 0.1, 0.05, 0.0),
     correct_first_only: bool = False,
+    skip_gripper: bool = True,
     verbose: bool = False,
 ):
     """
@@ -1054,6 +1055,15 @@ def line_search_energy_correction_seq(
         head), then try several α's plus α=0 and return the one with minimum
         energy. Including α=0 is what formally guarantees "never worse than
         BC": the line search can always fall back to the uncorrected action.
+
+    Path A (2026-04-27, see docs/VEL_v2_progress.md):
+      * `skip_gripper=True` zeros the last action dim of the gradient before
+        unit-normalising. The energy head was trained with gripper ∈ {0, 1}
+        only (binary), so its prediction at gripper ∈ (0.2, 0.8) is undefined
+        extrapolation. Letting the gradient touch gripper drives candidates
+        into that extrapolation region and argmin picks spurious basins —
+        which is the catastrophic SR collapse on gripper-heavy suites
+        (object/long).
 
     Compute cost: 1 gradient evaluation + len(alphas) energy evaluations
     (≈ 5 tiny forwards, negligible latency even for π0.5).
@@ -1089,6 +1099,14 @@ def line_search_energy_correction_seq(
     if correct_first_only:
         mask = torch.zeros_like(grad_A); mask[:, 0, :] = 1.0
         grad_A = grad_A * mask
+
+    # Path A: gripper dim is binary at training time → out-of-distribution at
+    # any continuous value. Zero it out before normalising so it can never
+    # contribute to the unit direction. Candidates' gripper values then come
+    # entirely from A_base (i.e. the BC gripper, after the legacy convention
+    # transforms above).
+    if skip_gripper:
+        grad_A[..., -1] = 0.0
 
     # Unit-norm direction — we use magnitude only through α.
     g_flat = grad_A.reshape(1, -1)
@@ -1378,9 +1396,13 @@ def get_vla_action(
         # α=0 is always appended so the correction can never be worse than BC.
         alpha_max = float(getattr(cfg, "energy_alpha", 0.2))
         alphas = (alpha_max, alpha_max * 0.5, alpha_max * 0.25, 0.0)
+        # Path A: default-on gripper-skip; expose `cfg.energy_skip_gripper` so
+        # the ablation row "w/o gripper-skip" can be produced by setting False.
+        skip_gripper = bool(getattr(cfg, "energy_skip_gripper", True))
         action = line_search_energy_correction_seq(
             h_head, hiddens[-1], action, energy_pad_mask,
             alphas=alphas,
+            skip_gripper=skip_gripper,
         )
 
     # End energy-correction timing + emit rolling stats

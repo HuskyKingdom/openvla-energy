@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(python3 -c 'import ast *)",
-      "Bash(python3 -c \"import ast; ast.parse\\(open\\('experiments/robot/openvla_utils.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('experiments/robot/openvla_utils.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(bash -n /home/yuhang/Desktop/oft-workspace/openvla-energy/auto_eval_energy.sh)"
     ],
     "additionalDirectories": [
       "/home/yuhang/Desktop/oft-workspace/openvla-energy"
