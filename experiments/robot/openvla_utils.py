@@ -1041,9 +1041,11 @@ def line_search_energy_correction_seq(
     alphas=(0.2, 0.1, 0.05, 0.0),
     correct_first_only: bool = False,
     skip_gripper: bool = True,
-    accept_mode: str = "monotonic",
+    accept_mode: str = "trust",
     tau: float = 4.0,
     monotonic_tol: float = 0.0,
+    trust_rho_lo: float = 0.3,
+    trust_rho_hi: float = 3.0,
     verbose: bool = False,
 ):
     """
@@ -1066,25 +1068,32 @@ def line_search_energy_correction_seq(
         extrapolation. Letting the gradient touch gripper drives candidates
         into that extrapolation region and argmin picks spurious basins.
 
-    Path B (2026-04-27, see docs/VEL_v2_progress.md):
-      * Path A alone failed: SR dropped further (object 41.8→36.0) because
-        skip_gripper concentrates the wrong-direction gradient mass into pose
-        dims, making pose corrections worse. Diagnosis: the trained energy
-        landscape has spurious local minima everywhere, not just at gripper.
-        Argmin greedily exploits any low-E pocket, even one that's far from
-        expert.
-      * Solution: accept_mode gates the correction. The default 'monotonic'
-        criterion only accepts a non-zero α if (i) energies decrease
-        monotonically along the α-grid, AND (ii) argmin lands at α_max
-        (the deepest step). Both conditions fail near spurious basins.
-        On rejection we fall back to α=0 (i.e. BC), which is provably no
-        worse than the uncorrected baseline.
+    Path B v1 (2026-04-27): 'monotonic' acceptance gate. Failed to catch
+    spurious basins on spatial (SR 83.4 vs no-gate 83.8 — within noise),
+    because spurious basins ARE monotonic when sampled from BC: the line
+    search walks from the basin rim to its bottom, so energies decrease at
+    every step → 'monotonic' check is too weak.
+
+    Path B v2 (2026-04-27): 'trust' acceptance gate (default).
+      * First-order Taylor predicts drop = α · ‖∇E‖₂ for unit-direction step.
+      * Compare predicted drop to actual drop = E_BC − E_best. ratio = actual/pred.
+        - Real local valley: landscape is approximately linear → ρ ≈ 1.
+        - Spurious basin: ‖∇E‖ at BC is moderate but basin floor is deep →
+          actual drop >> predicted → ρ ≫ 1. Reject.
+        - Wrong direction (saddle / flat): predicted is significant but actual
+          is tiny or negative → ρ < ρ_lo. Reject.
+      * Default acceptance window ρ ∈ [0.3, 3.0]. Tunable via
+        trust_rho_lo / trust_rho_hi.
 
     accept_mode options:
-      - 'always'    : current naive argmin (P1 baseline; reproduces 41.8/33.0 collapse).
+      - 'always'    : naive argmin (P1 baseline; reproduces 41.8/33.0 collapse).
       - 'monotonic' : monotonic descent along α-grid + argmin at α_max.
+                      Demonstrably too weak (does not reject spurious basins).
       - 'slope'     : require (E_BC - E_best) > tau * mean_abs(best - BC).
-      - 'both'      : monotonic AND slope.
+                      Note: this *accepts* large drops, so it is biased toward
+                      passing spurious basins. Kept for ablation.
+      - 'trust'     : DEFAULT. Trust-region ratio in [trust_rho_lo, trust_rho_hi].
+      - 'both'      : monotonic AND slope (legacy; not recommended).
 
     A_bc: numpy [H, Da] or tensor [B,H,Da].
     Returns numpy [H, Da] in the same gripper convention as the input path.
@@ -1162,6 +1171,14 @@ def line_search_energy_correction_seq(
         max_alpha = max(a_list)
         argmin_alpha = a_list[best_idx]
 
+        # Reused by multiple modes — find the α=0 anchor energy.
+        try:
+            idx_zero = a_list.index(0.0)
+        except ValueError:
+            idx_zero = order[0]   # smallest-α fallback
+        E_zero = E_list[idx_zero]
+        E_best = E_list[best_idx]
+
         monotonic_ok = True
         for i in range(len(sorted_E) - 1):
             # Energy must non-increase as α grows (with tolerance).
@@ -1175,16 +1192,33 @@ def line_search_energy_correction_seq(
 
         slope_pass = True
         if accept_mode in ("slope", "both"):
-            # E_BC = energy at α=0 candidate. Find that index.
-            try:
-                idx_zero = a_list.index(0.0)
-            except ValueError:
-                idx_zero = order[0]   # smallest-α fallback
-            E_zero = E_list[idx_zero]
-            E_best = E_list[best_idx]
             step_l1 = (candidates[best_idx] - A_base[0]).abs().mean().item()
             slope_required = tau * step_l1
             slope_pass = (E_zero - E_best) > slope_required
+
+        # Trust-region ratio test (Path B v2):
+        # Predicted drop from 1st-order Taylor at A_BC for unit-direction step:
+        #   ΔE_pred = α · ‖∇E‖₂   (since direction = ∇E / ‖∇E‖₂, step = -α · direction
+        #                            ⇒ ⟨∇E, step⟩ = -α · ‖∇E‖)
+        # Compare to actual drop = E_zero - E_best. ratio ≈ 1 for real linear
+        # valley; ratio ≫ 1 for spurious basin (BC's gradient does not
+        # anticipate the basin's depth); ratio < ρ_lo for wrong direction
+        # / saddle (predicted drop fails to materialise).
+        trust_pass = True
+        trust_ratio = float('nan')
+        if accept_mode in ("trust",):
+            grad_l2 = float(g_norm.item())
+            predicted_drop = float(argmin_alpha) * grad_l2
+            actual_drop = E_zero - E_best
+            if predicted_drop < 1e-9:
+                # Either α=0 picked or zero gradient → degenerate; reject so we
+                # fall back to BC. (This is the right behaviour: there's no
+                # signal to act on.)
+                trust_pass = False
+                trust_ratio = 0.0
+            else:
+                trust_ratio = actual_drop / predicted_drop
+                trust_pass = (trust_rho_lo <= trust_ratio <= trust_rho_hi)
 
         if accept_mode == "monotonic":
             accept = monotonic_pass
@@ -1194,6 +1228,10 @@ def line_search_energy_correction_seq(
             accept = slope_pass
             if not accept:
                 fail_reason = "slope-fail"
+        elif accept_mode == "trust":
+            accept = trust_pass
+            if not accept:
+                fail_reason = f"trust ρ={trust_ratio:.3f}∉[{trust_rho_lo},{trust_rho_hi}]"
         elif accept_mode == "both":
             accept = monotonic_pass and slope_pass
             if not accept:
@@ -1484,11 +1522,13 @@ def get_vla_action(
         alphas = (alpha_max, alpha_max * 0.5, alpha_max * 0.25, 0.0)
         # Path A: default-on gripper-skip.
         skip_gripper = bool(getattr(cfg, "energy_skip_gripper", True))
-        # Path B: acceptance gate (default "monotonic"). Set "always" to
-        # reproduce the P1 baseline (no gate).
-        accept_mode = str(getattr(cfg, "energy_accept_mode", "monotonic"))
+        # Path B: acceptance gate. Default 'trust' (v2; ratio-based).
+        # 'monotonic' (v1) is kept for ablation but is demonstrably too weak.
+        accept_mode = str(getattr(cfg, "energy_accept_mode", "trust"))
         tau = float(getattr(cfg, "energy_tau", 4.0))
         monotonic_tol = float(getattr(cfg, "energy_monotonic_tol", 0.0))
+        trust_rho_lo = float(getattr(cfg, "energy_trust_rho_lo", 0.3))
+        trust_rho_hi = float(getattr(cfg, "energy_trust_rho_hi", 3.0))
         action = line_search_energy_correction_seq(
             h_head, hiddens[-1], action, energy_pad_mask,
             alphas=alphas,
@@ -1496,6 +1536,8 @@ def get_vla_action(
             accept_mode=accept_mode,
             tau=tau,
             monotonic_tol=monotonic_tol,
+            trust_rho_lo=trust_rho_lo,
+            trust_rho_hi=trust_rho_hi,
         )
 
     # End energy-correction timing + emit rolling stats

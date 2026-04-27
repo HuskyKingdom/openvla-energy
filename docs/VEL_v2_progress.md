@@ -4,6 +4,87 @@
 
 ---
 
+## 2026-04-27 · 路径 B v1 (monotonic) 失败 → 路径 B v2 (trust-region) 实施
+
+### B v1 (monotonic) eval 结果（spatial）
+
+| 配置 | spatial SR |
+|---|---|
+| α=0 baseline | 92.6 |
+| α=0.2 + skip=False + 无 gate | 83.8 |
+| **α=0.2 + skip=False + monotonic gate** | **83.4** |
+
+83.4 vs 83.8 差 0.4%（500 episode 1σ ≈ 1.7%），**在噪声内** → gate 几乎没拒绝任何 correction。
+
+### 失败原因：spurious basin 也是单调的
+
+我把"argmin 在 α_max + 单调下降"当作 valley 判据，但这正好也是 spurious basin 的特征：
+
+- α=0：    E_BC ≈ −30
+- α=0.05： E ≈ −32（朝 basin 走，能量下降）
+- α=0.1：  E ≈ −35（更深）
+- α=0.2：  E ≈ −50（落入 basin）
+
+完美单调 + argmin 在 α_max → 我的 gate 判 PASS → 走进 basin。
+
+判定 spurious 与 valley 用 4 个 sample 的能量序列**信息量不够**，需要换思路。
+
+### 路径 B v2: Trust-Region Ratio
+
+数值优化里的标准做法。用 1st-order Taylor 估计能量下降量：
+
+```
+predicted_drop = α · ‖∇E(A_BC)‖₂        (因为 direction = ∇E/‖∇E‖, step = -α·dir)
+actual_drop    = E_BC − E_best
+ρ              = actual_drop / predicted_drop
+```
+
+行为：
+
+| 场景 | predicted | actual | ρ |
+|---|---|---|---|
+| Real local valley（线性区） | ≈ valley slope | ≈ valley slope | **≈ 1.0** |
+| Spurious basin（BC 在基底外） | 小（BC 处梯度温和） | 大（basin 底深） | **≫ 1**（5–100x 常见） |
+| Wrong direction / saddle / 平坦区 | 中等（梯度有但方向乱） | 接近 0 或负 | **< ρ_lo** |
+
+接受窗口 `ρ ∈ [0.3, 3.0]`：拒绝两端，只接受"线性近似 ±3 倍"的合理修正。
+
+### 实施
+
+| 文件 | 改动 |
+|---|---|
+| [experiments/robot/openvla_utils.py:1036-1047](../experiments/robot/openvla_utils.py#L1036-L1047) | `line_search_energy_correction_seq` 新增 `accept_mode='trust'` + `trust_rho_lo/hi` |
+| [experiments/robot/openvla_utils.py:1182-1196](../experiments/robot/openvla_utils.py#L1182-L1196) | trust-region ratio 计算 + 接受窗口判定 |
+| [experiments/robot/openvla_utils.py:1413-1423](../experiments/robot/openvla_utils.py#L1413-L1423) | call site 增加两个 cfg 字段 |
+| [experiments/robot/libero/run_libero_eval.py:155-160](../experiments/robot/libero/run_libero_eval.py#L155-L160) | 新增 `energy_trust_rho_lo / energy_trust_rho_hi` CLI flag，默认改 `accept_mode='trust'` |
+| [auto_eval_energy.sh](../auto_eval_energy.sh) | shell 变量 + 4 个 suite 的调用都已 thread |
+
+### B v2 期望行为
+
+- **Spurious basin** （ρ ≫ 3）→ reject → 回退 α=0 = BC，**保底 = baseline**
+- **Wrong direction** （ρ < 0.3）→ reject → 同上
+- **Real valley** （ρ ≈ 1）→ accept → 应用校正 → SR 提升
+
+最坏情形：rejected rate ~100% → SR ≈ baseline，**至少不破坏 BC**。
+最好情形：rejected ~80–90%，剩下 10–20% 都是真 valley → SR > baseline + 1%。
+
+### 决策点（同 v1）
+
+跑完 4 suite 后看：
+- SR ≥ baseline + 1% → P1+B v2 是有效方法，写进 paper Table 1
+- baseline ± 0.5% → trust gate 太严或 P1 critic 没用，进 Path C (P2)
+- SR < baseline → trust 实现有 bug 或 ρ 阈值不对，调 `[ρ_lo, ρ_hi]`
+
+### 调参建议
+
+如果 spatial 跑出来 ≈ baseline（92.6），说明 trust 拒绝率接近 100%。这时可以：
+1. 放宽 `ENERGY_TRUST_RHO_HI` 到 5.0 或 10.0（容忍更深的 basin —— 但风险高）
+2. 增大 `ENERGY_ALPHA` 到 0.3 或 0.4（让真 valley 更显著，predicted 也大）
+
+如果 spatial 显著低于 baseline（< 90），说明 ρ 公式有 bug，开 `verbose=True` 在 line_search 看实际 ρ 分布。
+
+---
+
 ## 2026-04-27 · 路径 A 失败 → 路径 B 实施完成
 
 ### 路径 A eval 结果

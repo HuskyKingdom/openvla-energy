@@ -19,17 +19,24 @@ E_DECODING=True
 ENERGY_SKIP_GRIPPER=False
 
 # Path B (docs/VEL_v2_progress.md 2026-04-27): acceptance gate.
-#   ENERGY_ACCEPT_MODE ∈ {always, monotonic, slope, both}
+#   ENERGY_ACCEPT_MODE ∈ {always, monotonic, slope, trust, both}
 #     - always    : reproduce P1 baseline (no gate, naive argmin) — known broken
-#     - monotonic : default. Accept only if energies strictly decrease along
-#                   the α-grid AND argmin is at α_max. Rejects spurious basins.
-#     - slope     : accept only if (E_BC - E_best) > tau · mean_abs(best - BC)
-#     - both      : require both conditions
-#   ENERGY_TAU            : slope criterion threshold (only matters in slope/both)
+#     - monotonic : v1. Demonstrably too weak (spurious basins ARE monotonic).
+#     - slope     : (E_BC - E_best) > tau · mean_abs(best - BC). Biased toward
+#                   accepting deep drops, kept for ablation.
+#     - trust     : v2 DEFAULT. Trust-region ratio test:
+#                     ρ = actual_drop / predicted_drop ∈ [ρ_lo, ρ_hi]
+#                     where predicted = α · ‖∇E‖₂.
+#                   Real linear valley: ρ ≈ 1. Spurious basin: ρ ≫ 1. Reject.
+#     - both      : monotonic AND slope (legacy combo)
+#   ENERGY_TAU            : slope threshold (only matters in slope/both)
 #   ENERGY_MONOTONIC_TOL  : tolerance for "monotonic" check (in energy units)
-ENERGY_ACCEPT_MODE=monotonic
+#   ENERGY_TRUST_RHO_LO/HI: trust-region acceptance window
+ENERGY_ACCEPT_MODE=trust
 ENERGY_TAU=4.0
 ENERGY_MONOTONIC_TOL=0.0
+ENERGY_TRUST_RHO_LO=0.3
+ENERGY_TRUST_RHO_HI=3.0
 RUN_TAG=v2_p1_alpha_0.2_skipgripper
 
 # Timing profile switch — 1 = print rolling VLA / energy / total latency stats.
@@ -50,6 +57,8 @@ echo N | python experiments/robot/libero/run_libero_eval.py \
     --energy_accept_mode    $ENERGY_ACCEPT_MODE \
     --energy_tau            $ENERGY_TAU \
     --energy_monotonic_tol  $ENERGY_MONOTONIC_TOL \
+    --energy_trust_rho_lo   $ENERGY_TRUST_RHO_LO \
+    --energy_trust_rho_hi   $ENERGY_TRUST_RHO_HI \
     --task_label            ${RUN_TAG}_spatial
 
 echo "Evaluating object ------------------------------"
@@ -64,6 +73,8 @@ echo N | python experiments/robot/libero/run_libero_eval.py \
     --energy_accept_mode    $ENERGY_ACCEPT_MODE \
     --energy_tau            $ENERGY_TAU \
     --energy_monotonic_tol  $ENERGY_MONOTONIC_TOL \
+    --energy_trust_rho_lo   $ENERGY_TRUST_RHO_LO \
+    --energy_trust_rho_hi   $ENERGY_TRUST_RHO_HI \
     --task_label            ${RUN_TAG}_object
 
 echo "Evaluating goal ------------------------------"
@@ -78,6 +89,8 @@ echo N | python experiments/robot/libero/run_libero_eval.py \
     --energy_accept_mode    $ENERGY_ACCEPT_MODE \
     --energy_tau            $ENERGY_TAU \
     --energy_monotonic_tol  $ENERGY_MONOTONIC_TOL \
+    --energy_trust_rho_lo   $ENERGY_TRUST_RHO_LO \
+    --energy_trust_rho_hi   $ENERGY_TRUST_RHO_HI \
     --task_label            ${RUN_TAG}_goal
 
 echo "Evaluating long ------------------------------"
@@ -92,4 +105,6 @@ echo N | python experiments/robot/libero/run_libero_eval.py \
     --energy_accept_mode    $ENERGY_ACCEPT_MODE \
     --energy_tau            $ENERGY_TAU \
     --energy_monotonic_tol  $ENERGY_MONOTONIC_TOL \
+    --energy_trust_rho_lo   $ENERGY_TRUST_RHO_LO \
+    --energy_trust_rho_hi   $ENERGY_TRUST_RHO_HI \
     --task_label            ${RUN_TAG}_long

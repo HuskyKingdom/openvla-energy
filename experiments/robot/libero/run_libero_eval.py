@@ -148,11 +148,14 @@ class GenerateConfig:
     # the catastrophic-collapse ablation row.
     energy_skip_gripper:bool = True
     # Path B (docs/VEL_v2_progress.md 2026-04-27): acceptance gate. One of
-    # 'always' / 'monotonic' / 'slope' / 'both'. Default 'monotonic' rejects
-    # corrections that don't form a monotonic descent on the α-grid.
-    energy_accept_mode:str = "monotonic"
+    # 'always' / 'monotonic' / 'slope' / 'trust' / 'both'. Default 'trust'
+    # uses 1st-order Taylor predicted-vs-actual drop ratio to reject spurious
+    # basins (monotonic was demonstrably too weak).
+    energy_accept_mode:str = "trust"
     energy_tau:float = 4.0
     energy_monotonic_tol:float = 0.0
+    energy_trust_rho_lo:float = 0.3
+    energy_trust_rho_hi:float = 3.0
 
     # fmt: on
 
