@@ -147,6 +147,12 @@ class GenerateConfig:
     # energy gradient before line-search. Default on. Set False to reproduce
     # the catastrophic-collapse ablation row.
     energy_skip_gripper:bool = True
+    # Path B (docs/VEL_v2_progress.md 2026-04-27): acceptance gate. One of
+    # 'always' / 'monotonic' / 'slope' / 'both'. Default 'monotonic' rejects
+    # corrections that don't form a monotonic descent on the α-grid.
+    energy_accept_mode:str = "monotonic"
+    energy_tau:float = 4.0
+    energy_monotonic_tol:float = 0.0
 
     # fmt: on
 

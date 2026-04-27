@@ -1041,10 +1041,13 @@ def line_search_energy_correction_seq(
     alphas=(0.2, 0.1, 0.05, 0.0),
     correct_first_only: bool = False,
     skip_gripper: bool = True,
+    accept_mode: str = "monotonic",
+    tau: float = 4.0,
+    monotonic_tol: float = 0.0,
     verbose: bool = False,
 ):
     """
-    VEL v2 (P1): energy-monitored line-search correction.
+    VEL v2 (P1+P2): energy-monitored line-search correction with acceptance gate.
 
     Rationale (docs/VEL_v2_plan.md §3.5):
       * Fixed-α residual update degrades when k>1 because the (sigmoid-era)
@@ -1061,12 +1064,27 @@ def line_search_energy_correction_seq(
         unit-normalising. The energy head was trained with gripper ∈ {0, 1}
         only (binary), so its prediction at gripper ∈ (0.2, 0.8) is undefined
         extrapolation. Letting the gradient touch gripper drives candidates
-        into that extrapolation region and argmin picks spurious basins —
-        which is the catastrophic SR collapse on gripper-heavy suites
-        (object/long).
+        into that extrapolation region and argmin picks spurious basins.
 
-    Compute cost: 1 gradient evaluation + len(alphas) energy evaluations
-    (≈ 5 tiny forwards, negligible latency even for π0.5).
+    Path B (2026-04-27, see docs/VEL_v2_progress.md):
+      * Path A alone failed: SR dropped further (object 41.8→36.0) because
+        skip_gripper concentrates the wrong-direction gradient mass into pose
+        dims, making pose corrections worse. Diagnosis: the trained energy
+        landscape has spurious local minima everywhere, not just at gripper.
+        Argmin greedily exploits any low-E pocket, even one that's far from
+        expert.
+      * Solution: accept_mode gates the correction. The default 'monotonic'
+        criterion only accepts a non-zero α if (i) energies decrease
+        monotonically along the α-grid, AND (ii) argmin lands at α_max
+        (the deepest step). Both conditions fail near spurious basins.
+        On rejection we fall back to α=0 (i.e. BC), which is provably no
+        worse than the uncorrected baseline.
+
+    accept_mode options:
+      - 'always'    : current naive argmin (P1 baseline; reproduces 41.8/33.0 collapse).
+      - 'monotonic' : monotonic descent along α-grid + argmin at α_max.
+      - 'slope'     : require (E_BC - E_best) > tau * mean_abs(best - BC).
+      - 'both'      : monotonic AND slope.
 
     A_bc: numpy [H, Da] or tensor [B,H,Da].
     Returns numpy [H, Da] in the same gripper convention as the input path.
@@ -1130,12 +1148,80 @@ def line_search_energy_correction_seq(
     energy_head.train()
 
     best_idx = int(torch.argmin(E_cands).item())
-    A_out = candidates[best_idx:best_idx + 1]
+    E_list = E_cands.flatten().tolist()
+    a_list = list(alphas)
+
+    # ---------- Path B: acceptance gate ----------
+    accept = True
+    fail_reason = ""
+    if accept_mode != "always":
+        # Sort (α, E) pairs in ascending α order so we can check monotonicity
+        # of energy as the step grows from 0 to α_max.
+        order = sorted(range(K), key=lambda i: a_list[i])
+        sorted_E = [E_list[i] for i in order]
+        max_alpha = max(a_list)
+        argmin_alpha = a_list[best_idx]
+
+        monotonic_ok = True
+        for i in range(len(sorted_E) - 1):
+            # Energy must non-increase as α grows (with tolerance).
+            if sorted_E[i + 1] > sorted_E[i] + monotonic_tol:
+                monotonic_ok = False
+                break
+        # argmin must be at the deepest step — otherwise we're sitting in a
+        # mid-grid basin, which is the spurious-minimum signature.
+        argmin_at_end = abs(argmin_alpha - max_alpha) < 1e-9
+        monotonic_pass = monotonic_ok and argmin_at_end
+
+        slope_pass = True
+        if accept_mode in ("slope", "both"):
+            # E_BC = energy at α=0 candidate. Find that index.
+            try:
+                idx_zero = a_list.index(0.0)
+            except ValueError:
+                idx_zero = order[0]   # smallest-α fallback
+            E_zero = E_list[idx_zero]
+            E_best = E_list[best_idx]
+            step_l1 = (candidates[best_idx] - A_base[0]).abs().mean().item()
+            slope_required = tau * step_l1
+            slope_pass = (E_zero - E_best) > slope_required
+
+        if accept_mode == "monotonic":
+            accept = monotonic_pass
+            if not accept:
+                fail_reason = "monotonic-fail" if not monotonic_ok else "argmin-not-at-end"
+        elif accept_mode == "slope":
+            accept = slope_pass
+            if not accept:
+                fail_reason = "slope-fail"
+        elif accept_mode == "both":
+            accept = monotonic_pass and slope_pass
+            if not accept:
+                fail_reason = []
+                if not monotonic_pass:
+                    fail_reason.append("mono")
+                if not slope_pass:
+                    fail_reason.append("slope")
+                fail_reason = "+".join(fail_reason)
+        else:
+            raise ValueError(f"Unknown accept_mode: {accept_mode!r}")
+
+    if not accept:
+        # Reject: fall back to the α=0 candidate (= BC after legacy gripper transform).
+        try:
+            fallback_idx = a_list.index(0.0)
+        except ValueError:
+            fallback_idx = best_idx   # no α=0 in grid, keep argmin (degenerate)
+        A_out = candidates[fallback_idx:fallback_idx + 1]
+        picked_alpha = a_list[fallback_idx]
+    else:
+        A_out = candidates[best_idx:best_idx + 1]
+        picked_alpha = a_list[best_idx]
 
     if verbose:
-        e_list = [f"{float(e):.6f}" for e in E_cands.flatten().tolist()]
-        a_list = list(alphas)
-        print(f"[LineSearch] α={a_list}  E={e_list}  picked α={a_list[best_idx]}")
+        e_list_str = [f"{e:.6f}" for e in E_list]
+        status = "ACCEPT" if accept else f"REJECT({fail_reason})"
+        print(f"[LineSearch] α={a_list}  E={e_list_str}  {status}  picked α={picked_alpha}")
 
     return A_out.squeeze(0).detach().cpu().to(torch.float32).numpy()
 
@@ -1391,18 +1477,25 @@ def get_vla_action(
     energy_start_time = time.time() if _TIMING_ENABLED else None
 
     if cfg.e_decoding:
-        # VEL v2 (P1): energy-monitored line-search correction (docs/VEL_v2_plan.md §3.5).
+        # VEL v2 (P1+P2): energy-monitored line-search correction with acceptance gate.
         # cfg.energy_alpha is still honoured as the *max* α in the line-search grid;
         # α=0 is always appended so the correction can never be worse than BC.
         alpha_max = float(getattr(cfg, "energy_alpha", 0.2))
         alphas = (alpha_max, alpha_max * 0.5, alpha_max * 0.25, 0.0)
-        # Path A: default-on gripper-skip; expose `cfg.energy_skip_gripper` so
-        # the ablation row "w/o gripper-skip" can be produced by setting False.
+        # Path A: default-on gripper-skip.
         skip_gripper = bool(getattr(cfg, "energy_skip_gripper", True))
+        # Path B: acceptance gate (default "monotonic"). Set "always" to
+        # reproduce the P1 baseline (no gate).
+        accept_mode = str(getattr(cfg, "energy_accept_mode", "monotonic"))
+        tau = float(getattr(cfg, "energy_tau", 4.0))
+        monotonic_tol = float(getattr(cfg, "energy_monotonic_tol", 0.0))
         action = line_search_energy_correction_seq(
             h_head, hiddens[-1], action, energy_pad_mask,
             alphas=alphas,
             skip_gripper=skip_gripper,
+            accept_mode=accept_mode,
+            tau=tau,
+            monotonic_tol=monotonic_tol,
         )
 
     # End energy-correction timing + emit rolling stats

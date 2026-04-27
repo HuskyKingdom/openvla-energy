@@ -4,6 +4,78 @@
 
 ---
 
+## 2026-04-27 · 路径 A 失败 → 路径 B 实施完成
+
+### 路径 A eval 结果
+
+| Suite | α=0 baseline | α=0.2 **无** skip | α=0.2 **有** skip（Path A） |
+|---|---|---|---|
+| spatial | 92.6 | 83.8 | **80.0** ↓ |
+| object | 98.8 | 41.8 | **36.0** ↓↓ |
+
+skip-gripper **反而让 SR 又掉 3.8 / 5.8 个点**。
+
+### 重新诊断
+
+skip-gripper 之后单位 direction 完全集中在 pose 维度 → pose 维度的实际步幅被放大 → 把原本被 gripper 数值掩盖的 **pose 维度错梯度**完全暴露。结论：
+
+- gripper 不是主犯，只是把症状显形了
+- **Pose 维度的能量梯度场也是坏的**
+- 根本原因：训练时 NCE/margin/GAL 只约束了 expert 处的能量值和 ε 球内的梯度方向，**球外能量场是任意的、有大量 spurious 局部低点**
+- Line-search 的 argmin 设计假设"低能量 = 接近 expert"，**但这个假设只在 expert ε 球内成立**；在球外，argmin 是个**贪婪坑利用器**，把动作往 spurious basin 推
+
+P1 整体设计被证伪：训练目标和 inference SR 不正相关，靠 line-search 在 rugged landscape 上做 argmin 会被坑吃掉所有理论增益。
+
+### 路径 B 实施（已落地）
+
+加 **acceptance gate** 拒绝 spurious basin。原理：
+
+> 真正的 valley 是单调下降的；spurious basin 是 isolated 低点。
+> 检查 α-grid 上的能量序列是否**单调非增**，且 argmin 落在 **α_max**（最深步）。
+> 任一不满足 → 拒绝校正，返回 α=0 候选（= BC，可证不劣化）。
+
+**代码改动**：
+
+| 文件 | 内容 |
+|---|---|
+| [experiments/robot/openvla_utils.py:1036-1209](../experiments/robot/openvla_utils.py#L1036-L1209) | `line_search_energy_correction_seq` 新增 `accept_mode / tau / monotonic_tol`；4 种模式 `always / monotonic / slope / both`；reject 时回退到 α=0 candidate |
+| [experiments/robot/openvla_utils.py:1393-1414](../experiments/robot/openvla_utils.py#L1393-L1414) | call site 从 `cfg.energy_accept_mode` 等读取 |
+| [experiments/robot/libero/run_libero_eval.py:151-156](../experiments/robot/libero/run_libero_eval.py#L151-L156) | 新增 3 个 CLI flag：`energy_accept_mode / energy_tau / energy_monotonic_tol` |
+| [auto_eval_energy.sh](../auto_eval_energy.sh) | 加 3 个 shell 变量 + 文档注释 |
+
+**默认值**：
+```
+ENERGY_ACCEPT_MODE=monotonic    # 拒绝 spurious basin
+ENERGY_TAU=4.0                  # slope 模式的 threshold (only used if mode=slope/both)
+ENERGY_MONOTONIC_TOL=0.0        # 单调检查的容差
+```
+
+### 路径 B 期望 SR
+
+最坏情况：所有校正都被 reject → SR ≡ α=0 baseline（92.6 / 98.8 / 96.4 / 94.6）→ P1 整体不破坏 BC，可写 ablation 行。
+
+中等情况：reject 大部分、accept 少数高质量校正 → SR 略高于 baseline (+0.3~1%) → P1 部分 work，靠 Path B 抢救。
+
+最好情况：reject 比例正好，accept 都是真 valley → SR > baseline + 1%。
+
+### 决策点
+
+跑 Path B 的 4-suite 全套：
+- 如果 **接近 baseline ± 0.5%** → P1 推理设计被证伪但不损害 BC，**进 Path C (P2)** 改训练分布
+- 如果 **baseline + 0.5–1.5%** → P1 部分成功，可考虑：
+  - (a) 调 `ENERGY_TAU` 找更好工作点（小 ablation 价值）
+  - (b) 直接 P2，把 P1+B 的数字当 baseline-improvement
+- 如果 **baseline + > 1.5%** → P1+B 已是有效 inference 策略，paper Table 1 主行用这个
+
+### 风险与开放问题（持续）
+
+- **Reject 比例需要监测**：开 `verbose=True` 看到 ACCEPT/REJECT 比例。如果 99% reject → gate 太严，调 `monotonic_tol` 放松；如果 0% reject → gate 失效，等于 always 模式。
+- **训练目标 vs SR 解耦** 仍未解。P2 必须实现 plan §3.6 landscape monitor，**用 held-out rank-correlation 替代 GAL_cos** 做主要早停指标。
+- **能量绝对值漂移**：Run#1/2/3 的 E_pos 各不同，loss 缺 absolute anchor。P2 加 `λ_anchor · E_pos²` (λ≈0.001)，对 slope 模式的 τ 设定关键。
+- **GAL_cos = 0.4 天花板**：P2 的 N1–N5 structured negatives 应能突破到 0.55+。如果 P2 后仍 ≤ 0.45 才考虑加 capacity。
+
+---
+
 ## 2026-04-27 · P1 eval 结果 → 灾难性退化诊断 → 路径 A/B/C 决策
 
 ### Eval 结果
