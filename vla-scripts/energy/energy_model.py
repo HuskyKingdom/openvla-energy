@@ -159,10 +159,11 @@ class EnergyModel(nn.Module):
         hidden: int = 512,
         head: int = 8,
         layers: int = 4,
+        bounded_energy: bool = False,
     ):
         super().__init__()
 
-     
+
         # self.energy_bc = FFWRelativeCrossAttentionModule(hidden,head,layers)
         self.cross = nn.MultiheadAttention(hidden, head, batch_first=True)
 
@@ -182,11 +183,15 @@ class EnergyModel(nn.Module):
 
 
         self.T = 30.0               # temperature for energy range
-        
-        self.act = nn.Sigmoid() 
-        # self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden))
-        self.energy_scale = 2.0
-        self.energy_offset = 0.1
+        # Unbounded (linear) output is the default; the original sigmoid*2+0.1
+        # compressed the logit range and saturated gradients near the boundary,
+        # which is the suspected root cause of the brittle landscape reported
+        # by reviewers. Pass bounded_energy=True to reproduce the old behaviour.
+        self.bounded_energy = bounded_energy
+        if bounded_energy:
+            self.act = nn.Sigmoid()
+            self.energy_scale = 2.0
+            self.energy_offset = 0.1
     
 
     def forward(self, hN: torch.Tensor, a: torch.Tensor, pad_mask = None, reduce="sum", gamma=None) -> torch.Tensor:
@@ -247,10 +252,13 @@ class EnergyModel(nn.Module):
         # assert_finite(energy_feature_step, "energy_feature_step")
 
 
-        # raw = self.T * torch.tanh(raw / self.T)
-        energy_feature_step = energy_feature_step * 0.5
-        E = self.act(energy_feature_step) * self.energy_scale + self.energy_offset
-        # assert_finite(E, "E")
+        if self.bounded_energy:
+            # legacy path: sigmoid * 2 + 0.1, kept only for ablation/back-compat
+            energy_feature_step = energy_feature_step * 0.5
+            E = self.act(energy_feature_step) * self.energy_scale + self.energy_offset
+        else:
+            # unbounded linear energy: full real range, no gradient saturation
+            E = energy_feature_step
 
         energy_avg = self.pool(E)
         assert_finite(energy_avg, "energy_avg")
@@ -422,32 +430,92 @@ def compute_negative_energy(energy_head, A_star, layer_actions, delta, hidden_N,
 
 
 
-def energy_infonce_loss(energy_model, h, a_pos, a_negs, pad_mask, tau=0.5, reduce_steps="mean"):
+def energy_infonce_loss(energy_model, h, a_pos, a_negs, pad_mask=None, tau=0.5, reduce_steps="mean"):
     """
-    h:     [B,S,Dh]   
-    a_pos: [B,H,Da]  
-    a_negs:[B,M,H,Da]  M Negatives
+    InfoNCE with explicit per-anchor negative actions (structured negatives).
+    h:     [B,S,Dh]
+    a_pos: [B,H,Da]
+    a_negs:[B,M,H,Da]  M negatives per anchor
+    pad_mask: [B,S] boolean key_padding_mask (True = pad), or None
+    Returns: loss, E_pos_mean, E_negs_mean
     """
     B, H, Da = a_pos.shape
     M = a_negs.shape[1]
 
-    # --- E_pos ---
-    # [B,1] -> [B]
-    E_pos, _ = energy_model(h, a_pos, reduce=reduce_steps)
-    E_pos = E_pos.squeeze(-1)  # [B]
+    # --- E_pos --- ([B,1] -> [B])
+    E_pos = energy_model(h, a_pos, pad_mask).squeeze(-1)
 
     # --- E_negs ---
-    a_negs_flat = a_negs.reshape(B * M, H, Da)            # [B*M,H,Da]
-    h_rep       = h.repeat_interleave(M, dim=0)           # [B*M,S,Dh]
+    a_negs_flat = a_negs.reshape(B * M, H, Da)                          # [B*M,H,Da]
+    h_rep       = h.repeat_interleave(M, dim=0)                         # [B*M,S,Dh]
+    pm_rep      = pad_mask.repeat_interleave(M, dim=0) if pad_mask is not None else None
 
-    E_negs, _ = energy_model(h_rep, a_negs_flat, pad_mask, reduce=reduce_steps)  # [B*M,1]
-    E_negs = E_negs.view(B, M).contiguous()               # [B,M]
+    E_negs = energy_model(h_rep, a_negs_flat, pm_rep).view(B, M).contiguous()  # [B,M]
 
-    # --- EnergyNCE： -E as logits ---
-    logits = torch.cat([(-E_pos).unsqueeze(1), -E_negs], dim=1) / tau  # [B,1+M]
-    target = torch.zeros(B, dtype=torch.long, device=logits.device)    # expert energy index at 0
+    # --- EnergyNCE: logits = -E / tau, expert index at 0 ---
+    logits = torch.cat([(-E_pos).unsqueeze(1), -E_negs], dim=1) / tau   # [B,1+M]
+    target = torch.zeros(B, dtype=torch.long, device=logits.device)
+    loss = F.cross_entropy(logits, target)
 
-    return torch.nn.functional.cross_entropy(logits, target), E_pos.mean(), E_negs.mean()
+    return loss, E_pos.mean(), E_negs.mean()
+
+
+def build_structured_negatives(
+    layer_actions,
+    a_pos: torch.Tensor,
+    use_layer_actions: bool = True,
+    use_gaussian: bool = True,
+    use_amplitude: bool = True,
+    use_directional: bool = True,
+    gaussian_sigma: float = 0.3,
+    clamp_range: tuple = (-1.0, 1.0),
+):
+    """
+    Construct per-anchor structured negatives.
+
+    Sources (each contributes one [B,H,Da] tensor):
+      1) layer_actions[k] for a few k — early-exit policy guesses (hard negatives:
+         scene-correct, action plausible-but-wrong; what the policy itself would
+         emit at intermediate depths). Skipped if fewer than 4 layers available.
+      2) Gaussian perturbation of expert actions (medium-difficulty).
+      3) Amplitude scaling x{0.3, 1.7} (preserves direction, breaks magnitude).
+      4) Single-dim directional flip per sample (breaks direction, preserves magnitude).
+
+    Returns negs: [B, M, H, Da] (M depends on which sources are enabled).
+    """
+    B, H, Da = a_pos.shape
+    device = a_pos.device
+    dtype = a_pos.dtype
+    negs = []
+
+    if use_layer_actions and layer_actions is not None and len(layer_actions) >= 4:
+        # quarter-depth and mid-depth — partial-policy outputs
+        idxs = [max(1, len(layer_actions) // 4), len(layer_actions) // 2]
+        for i in idxs:
+            la = layer_actions[i].to(device=device, dtype=dtype)
+            if la.shape == a_pos.shape:
+                negs.append(la)
+
+    if use_gaussian:
+        negs.append(add_gaussian_noise(a_pos, sigma=gaussian_sigma, clamp=clamp_range))
+
+    if use_amplitude:
+        negs.append((a_pos * 0.3).clamp(*clamp_range))
+        negs.append((a_pos * 1.7).clamp(*clamp_range))
+
+    if use_directional:
+        # per-sample, flip a single random action dim across the chunk
+        flip = a_pos.clone()
+        rand_dim = torch.randint(0, Da, (B,), device=device)
+        idx = rand_dim.view(B, 1, 1).expand(B, H, 1)
+        flipped_col = -flip.gather(-1, idx)
+        flip.scatter_(-1, idx, flipped_col)
+        negs.append(flip)
+
+    if len(negs) == 0:
+        raise ValueError("build_structured_negatives produced 0 negatives; enable at least one source")
+
+    return torch.stack(negs, dim=1)  # [B, M, H, Da]
 
 
 

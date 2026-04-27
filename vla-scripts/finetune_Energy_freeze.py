@@ -66,7 +66,15 @@ from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # energy
-from energy.energy_model import EnergyModel, compute_negative_energy, energy_infonce_loss, get_negatives, energy_inbatch_swap_infonce_2d, energy_inbatch_swap_infonce
+from energy.energy_model import (
+    EnergyModel,
+    build_structured_negatives,
+    compute_negative_energy,
+    energy_infonce_loss,
+    energy_inbatch_swap_infonce,
+    energy_inbatch_swap_infonce_2d,
+    get_negatives,
+)
 
 @dataclass
 class FinetuneConfig:
@@ -119,8 +127,21 @@ class FinetuneConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
-    energy_warm_steps: int = 0     
+    energy_warm_steps: int = 0
     energy_learning_rate: float = 5e-4
+
+    # Energy head: bounded vs unbounded scalar output.
+    # The original sigmoid * 2 + 0.1 path saturates gradients near boundaries
+    # and compresses InfoNCE logit range (suspected root cause of brittle
+    # landscape reported by reviewers). New default = unbounded linear output.
+    bounded_energy: bool = False
+    # Negative-sampling strategy for the contrastive energy loss.
+    # "inbatch_swap"   : original in-batch swap InfoNCE (B-1 negatives per anchor, false-negative-prone)
+    # "structured"     : per-anchor structured negatives (layer-action + gaussian + amplitude + directional)
+    # "both"           : sum of the two losses
+    neg_strategy: str = "inbatch_swap"
+    energy_tau: float = 0.5
+    structured_loss_weight: float = 1.0
 
     # fmt: on
 
@@ -361,6 +382,9 @@ def run_forward_pass(
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
     energy_model = None,
+    neg_strategy: str = "inbatch_swap",
+    energy_tau: float = 0.5,
+    structured_loss_weight: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -498,8 +522,34 @@ def run_forward_pass(
 
         with torch.cuda.amp.autocast(enabled=False):
 
-            swap_loss, E_pos_mean, E_neg_mean = energy_inbatch_swap_infonce(energy_model,context_hidden,ground_truth_actions, energy_mask)
-            energy_loss = swap_loss
+            swap_loss = struct_loss = None
+            E_pos_mean = E_neg_mean = E_struct_neg_mean = None
+
+            if neg_strategy in ("inbatch_swap", "both"):
+                swap_loss, E_pos_mean, E_neg_mean = energy_inbatch_swap_infonce(
+                    energy_model, context_hidden, ground_truth_actions, energy_mask, tau=energy_tau,
+                )
+
+            if neg_strategy in ("structured", "both"):
+                a_negs = build_structured_negatives(layer_actions, ground_truth_actions)
+                struct_loss, E_pos_struct_mean, E_struct_neg_mean = energy_infonce_loss(
+                    energy_model, context_hidden, ground_truth_actions, a_negs,
+                    pad_mask=energy_mask, tau=energy_tau,
+                )
+                # use structured branch's E_pos if swap branch didn't run
+                if E_pos_mean is None:
+                    E_pos_mean = E_pos_struct_mean
+
+            if neg_strategy == "inbatch_swap":
+                energy_loss = swap_loss
+            elif neg_strategy == "structured":
+                energy_loss = struct_loss
+            elif neg_strategy == "both":
+                energy_loss = swap_loss + structured_loss_weight * struct_loss
+            else:
+                raise ValueError(
+                    f"unknown neg_strategy={neg_strategy!r}; expected inbatch_swap | structured | both"
+                )
 
 
 
@@ -554,15 +604,22 @@ def run_forward_pass(
             predicted_next_actions = predicted_actions[:, 1:]
             curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
             next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
-            metrics.update(
-                {
-                    "curr_action_l1_loss": curr_action_l1_loss.item(),
-                    "next_actions_l1_loss": next_actions_l1_loss.item(),
-                    "energy_loss": energy_loss.item(),
-                    "Positive_Energy": E_pos_mean.item(),
-                    "Negative_Energy": E_neg_mean.item(),
-                }
-            )
+            energy_metrics = {
+                "curr_action_l1_loss": curr_action_l1_loss.item(),
+                "next_actions_l1_loss": next_actions_l1_loss.item(),
+                "energy_loss": energy_loss.item(),
+            }
+            if E_pos_mean is not None:
+                energy_metrics["Positive_Energy"] = E_pos_mean.item()
+            if E_neg_mean is not None:
+                energy_metrics["Negative_Energy"] = E_neg_mean.item()
+            if swap_loss is not None:
+                energy_metrics["L_swap"] = swap_loss.item()
+            if struct_loss is not None:
+                energy_metrics["L_struct"] = struct_loss.item()
+            if E_struct_neg_mean is not None:
+                energy_metrics["Structured_Negative_Energy"] = E_struct_neg_mean.item()
+            metrics.update(energy_metrics)
 
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
     return loss, metrics, energy_loss
@@ -1054,7 +1111,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         NUM_PATCHES += 1
 
     # energy_model = EnergyModel(vla.module.llm_dim,7,512,4,NUM_ACTIONS_CHUNK).to(device_id).to(torch.bfloat16)
-    energy_model = EnergyModel(vla.module.llm_dim,7).to(device_id)
+    energy_model = EnergyModel(vla.module.llm_dim, 7, bounded_energy=cfg.bounded_energy).to(device_id)
 
 
     # freezing
@@ -1189,6 +1246,9 @@ def finetune(cfg: FinetuneConfig) -> None:
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
                 energy_model=energy_model,
+                neg_strategy=cfg.neg_strategy,
+                energy_tau=cfg.energy_tau,
+                structured_loss_weight=cfg.structured_loss_weight,
             )
 
             # Normalize loss to account for gradient accumulation
