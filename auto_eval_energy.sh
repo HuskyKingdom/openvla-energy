@@ -32,12 +32,12 @@ ENERGY_SKIP_GRIPPER=False
 #   ENERGY_TAU            : slope threshold (only matters in slope/both)
 #   ENERGY_MONOTONIC_TOL  : tolerance for "monotonic" check (in energy units)
 #   ENERGY_TRUST_RHO_LO/HI: trust-region acceptance window
-ENERGY_ACCEPT_MODE=trust
+ENERGY_ACCEPT_MODE=monotonic
 ENERGY_TAU=4.0
 ENERGY_MONOTONIC_TOL=0.0
 ENERGY_TRUST_RHO_LO=0.3
 ENERGY_TRUST_RHO_HI=3.0
-RUN_TAG=v2_p1_alpha_0.2_skipgripper
+RUN_TAG=v2_p1_alpha_0.2_monotonic
 
 # Timing profile switch — 1 = print rolling VLA / energy / total latency stats.
 # Leave at 0 for real SR runs (sync() kills GPU pipelining and inflates wall time).
